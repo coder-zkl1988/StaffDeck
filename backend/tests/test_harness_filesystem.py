@@ -511,6 +511,50 @@ def test_workspace_and_file_quotas_are_enforced_before_write(tmp_path: Path) -> 
     assert not (context.workspace_root / "b.txt").exists()
 
 
+def test_move_from_outside_workspace_enforces_quota(tmp_path: Path) -> None:
+    """外部文件 move 进工作区同样受配额约束(与 copy 一致)。"""
+    limits = HarnessLimits(
+        max_read_bytes=64,
+        max_file_bytes=8,
+        max_workspace_bytes=8,
+        max_entries=10,
+        max_result_bytes=1024,
+    )
+    executor, context = _harness(tmp_path, limits=limits)
+    _execute(executor, context, "write_file", {"path": "keep.txt", "content": "1234"})
+    external = tmp_path / "external.txt"
+    external.write_text("y" * 8)
+
+    blocked = _execute_failure(
+        executor,
+        context,
+        "move_file",
+        {"source_path": str(external), "destination_path": "inside.txt"},
+    )
+    assert blocked == "WORKSPACE_QUOTA_EXCEEDED"
+    assert not (context.workspace_root / "inside.txt").exists()
+
+    # 放得下的外部文件可以移入,工作区内 move 不新增占用
+    small_external = tmp_path / "small.txt"
+    small_external.write_text("abcd")
+    _execute(
+        executor,
+        context,
+        "move_file",
+        {"source_path": str(small_external), "destination_path": "inside.txt"},
+    )
+    assert (context.workspace_root / "inside.txt").read_text() == "abcd"
+    moved_inside = context.workspace_root / "inside.txt"
+    _execute(
+        executor,
+        context,
+        "move_file",
+        {"source_path": "inside.txt", "destination_path": "renamed.txt"},
+    )
+    assert not moved_inside.exists()
+    assert (context.workspace_root / "renamed.txt").read_text() == "abcd"
+
+
 def test_deleted_files_do_not_consume_workspace_quota(tmp_path: Path) -> None:
     limits = HarnessLimits(
         max_read_bytes=64,

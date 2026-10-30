@@ -233,11 +233,12 @@ export default function AgentsPage({
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
       <AppHeader
+        className="items-center"
         onLogout={onLogout}
         userName={currentUser?.username}
         left={(
-          <div className="flex h-[50px] w-full items-center gap-[6px] rounded-[20px] bg-white px-[20px] text-[#757F9C] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-            <IconSearch className="size-[20px] shrink-0" />
+          <div className="flex h-[32px] w-[280px] max-w-full items-center gap-[6px] rounded-[10px] bg-white px-[12px] text-[#757F9C] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+            <IconSearch className="size-[16px] shrink-0" />
             <input
               autoComplete="off"
               data-1p-ignore="true"

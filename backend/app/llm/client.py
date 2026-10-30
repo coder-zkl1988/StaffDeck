@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -84,8 +85,34 @@ EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
+# 观测载荷截断:原始 chunk 只保留前若干个,长文本只保留前若干字符,
+# 完整数据仍有真实响应链路承载,观测侧只需要排障样本。
+OBSERVABILITY_MAX_RAW_CHUNKS = 50
+OBSERVABILITY_MAX_TEXT_CHARS = 16_000
 class _CurrentStageText(str):
     pass
+
+
+_provider_client_cache: dict[tuple[str, str, str, float], Any] = {}
+_provider_client_cache_guard = threading.Lock()
+
+
+def _cached_provider_client(
+    key: tuple[str, str, str, float],
+    factory: Any,
+) -> Any:
+    """按 (协议, base_url, key, 超时) 复用 provider SDK 客户端。
+
+    每次调用新建客户端会重复建连并依赖 GC 回收底层连接池,长连接复用可摊销握手成本。
+    """
+    with _provider_client_cache_guard:
+        client = _provider_client_cache.get(key)
+        if client is None:
+            client = factory()
+            if len(_provider_client_cache) >= 64:
+                _provider_client_cache.clear()
+            _provider_client_cache[key] = client
+        return client
 
 
 class LLMClient:
@@ -96,7 +123,13 @@ class LLMClient:
             )
         except ValueError as exc:
             raise LLMError("MODEL_PROTOCOL_UNSUPPORTED") from exc
-        api_key = decrypt_secret(model_config.api_key_encrypted)
+        try:
+            api_key = decrypt_secret(model_config.api_key_encrypted)
+        except ValueError as exc:
+            # APP_SECRET 轮换后旧密文无法解密:给出可行动的错误而不是裸 500
+            raise LLMError(
+                "模型密钥无法用当前 APP_SECRET 解密,请在模型配置中重新保存 API Key"
+            ) from exc
         if not api_key:
             raise LLMError("Model API key is not configured")
         self.timeout_seconds = (
@@ -105,18 +138,30 @@ class LLMClient:
             or DEFAULT_MODEL_API_TIMEOUT_SECONDS
         )
         self.base_url = str(model_config.base_url or "")
+        client_cache_key = (
+            protocol.value,
+            self.base_url,
+            api_key,
+            float(self.timeout_seconds),
+        )
         if protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
-            self.client = OpenAI(
-                api_key=api_key,
-                base_url=self.base_url,
-                timeout=self.timeout_seconds,
+            self.client = _cached_provider_client(
+                client_cache_key,
+                lambda: OpenAI(
+                    api_key=api_key,
+                    base_url=self.base_url,
+                    timeout=self.timeout_seconds,
+                ),
             )
             self.driver = ChatCompletionsDriver(self.client)
         elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
-            self.client = OpenAI(
-                api_key=api_key,
-                base_url=self.base_url,
-                timeout=self.timeout_seconds,
+            self.client = _cached_provider_client(
+                client_cache_key,
+                lambda: OpenAI(
+                    api_key=api_key,
+                    base_url=self.base_url,
+                    timeout=self.timeout_seconds,
+                ),
             )
             self.driver = OpenAIResponsesDriver(self.client)
         elif protocol is ModelApiProtocol.ANTHROPIC_MESSAGES:
@@ -137,10 +182,17 @@ class LLMClient:
                 elif sdk_path.endswith("/v1"):
                     sdk_base_url = sdk_base_url[:-3].rstrip("/")
                 kwargs["base_url"] = sdk_base_url
-            self.client = Anthropic(**kwargs)
+            anthropic_kwargs = dict(kwargs)
+            self.client = _cached_provider_client(
+                client_cache_key,
+                lambda: Anthropic(**anthropic_kwargs),
+            )
             self.driver = AnthropicMessagesDriver(self.client)
         elif protocol is ModelApiProtocol.GEMINI_GENERATE_CONTENT:
-            self.client = httpx.Client(timeout=self.timeout_seconds)
+            self.client = _cached_provider_client(
+                client_cache_key,
+                lambda: httpx.Client(timeout=self.timeout_seconds),
+            )
             self.driver = GeminiGenerateContentDriver(
                 self.client,
                 self.base_url,
@@ -383,7 +435,8 @@ class LLMClient:
                     provider_setup_ms = span.elapsed_ms()
                     for chunk in stream:
                         chunk_count += 1
-                        response_chunks.append(_observable_provider_payload(chunk))
+                        if len(response_chunks) < OBSERVABILITY_MAX_RAW_CHUNKS:
+                            response_chunks.append(_observable_provider_payload(chunk))
                         chunk_usage_metrics = _usage_span_metrics(getattr(chunk, "usage", None))
                         if chunk_usage_metrics:
                             stream_usage_metrics.update(chunk_usage_metrics)
@@ -430,9 +483,13 @@ class LLMClient:
                         output_chars=output_chars,
                         stream_chunks=chunk_count,
                         reasoning_chars=reasoning_chars,
-                        partial_response_text="".join(recorded_parts),
-                        partial_reasoning_content="".join(recorded_reasoning_parts),
-                        partial_tool_call_deltas=tool_call_deltas,
+                        partial_response_text=_truncate_observability_text(
+                            "".join(recorded_parts)
+                        ),
+                        partial_reasoning_content=_truncate_observability_text(
+                            "".join(recorded_reasoning_parts)
+                        ),
+                        partial_tool_call_deltas=tool_call_deltas[:OBSERVABILITY_MAX_RAW_CHUNKS],
                         partial_response_chunks=response_chunks,
                         **stream_usage_metrics,
                     )
@@ -446,9 +503,11 @@ class LLMClient:
                     response_text = "".join(recorded_parts)
                     response_message = {
                         "role": "assistant",
-                        "content": response_text,
-                        "reasoning_content": "".join(recorded_reasoning_parts),
-                        "tool_call_deltas": tool_call_deltas,
+                        "content": _truncate_observability_text(response_text),
+                        "reasoning_content": _truncate_observability_text(
+                            "".join(recorded_reasoning_parts)
+                        ),
+                        "tool_call_deltas": tool_call_deltas[:OBSERVABILITY_MAX_RAW_CHUNKS],
                     }
                     span.finish(
                         provider_setup_ms=provider_setup_ms,
@@ -460,7 +519,10 @@ class LLMClient:
                         reasoning_chars=reasoning_chars,
                         finish_reasons=sorted(finish_reasons),
                         provider_response_ids=sorted(response_ids),
-                        response_text=response_text,
+                        response_chunks_truncated=max(
+                            0, chunk_count - len(response_chunks)
+                        ),
+                        response_text=_truncate_observability_text(response_text),
                         response_message=response_message,
                         response_chunks=response_chunks,
                         **stream_usage_metrics,
@@ -486,10 +548,13 @@ class LLMClient:
                     response_message={
                         "role": "assistant",
                         "content": "",
-                        "reasoning_content": "".join(recorded_reasoning_parts),
-                        "tool_call_deltas": tool_call_deltas,
+                        "reasoning_content": _truncate_observability_text(
+                            "".join(recorded_reasoning_parts)
+                        ),
+                        "tool_call_deltas": tool_call_deltas[:OBSERVABILITY_MAX_RAW_CHUNKS],
                     },
                     response_chunks=response_chunks,
+                    response_chunks_truncated=max(0, chunk_count - len(response_chunks)),
                     status="empty",
                     **stream_usage_metrics,
                 )
@@ -717,6 +782,12 @@ def _observable_completion_message(completion: Any) -> dict[str, Any]:
     payload.setdefault("role", "assistant")
     payload.setdefault("content", _content_text(getattr(message, "content", None)))
     return payload
+
+
+def _truncate_observability_text(value: str) -> str:
+    if len(value) <= OBSERVABILITY_MAX_TEXT_CHARS:
+        return value
+    return value[:OBSERVABILITY_MAX_TEXT_CHARS] + f"…(截断,共 {len(value)} 字符)"
 
 
 def _observable_provider_payload(value: Any) -> Any:

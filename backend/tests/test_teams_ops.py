@@ -303,6 +303,41 @@ def test_sweep_respects_team_timeout_config() -> None:
         assert stale.status == "escalated"
 
 
+def test_sweep_skips_task_with_live_lease_heartbeat() -> None:
+    """有活跃心跳租约的任务仍在真实执行,updated_at 停滞不应触发超时升级。"""
+    with _test_session() as db:
+        team = _seed_pool_team(db)
+        long_running = _make_timed_task(
+            db, team, status="in_progress", minutes_ago=60, assignee="agent_a"
+        )
+        wake = enqueue_wake_event(
+            db,
+            team=team,
+            target_agent_id="agent_a",
+            trigger_type="task_assigned",
+            payload={"task_id": long_running.id},
+        )
+        wake.status = "claimed"
+        wake.updated_at = utc_now()  # 心跳刚续约
+        db.add(wake)
+        db.commit()
+
+        swept = sweep_timed_out_tasks(db)
+
+        assert swept == []
+        db.refresh(long_running)
+        assert long_running.status == "in_progress"
+
+        # 租约过期后(执行线程已死)同一任务应被正常升级
+        wake.updated_at = utc_now() - timedelta(seconds=600)
+        db.add(wake)
+        db.commit()
+        swept = sweep_timed_out_tasks(db)
+        assert [task.id for task in swept] == [long_running.id]
+        db.refresh(long_running)
+        assert long_running.status == "escalated"
+
+
 def test_task_timeout_minutes_config_fallback() -> None:
     base = {"tenant_id": "t", "name": "n", "owner_user_id": "u"}
     assert task_timeout_minutes(Team(**base)) == DEFAULT_TASK_TIMEOUT_MINUTES

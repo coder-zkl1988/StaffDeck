@@ -17,7 +17,7 @@ ICNS = ASSETS / "staffdeck.icns"
 ICO = ASSETS / "staffdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
 
-RAW_VERSION = os.environ.get("VERSION", "0.1.0").strip() or "0.1.0"
+RAW_VERSION = os.environ.get("VERSION", "0.5.1").strip() or "0.5.1"
 if not re.fullmatch(
     r"[vV]?\d+(?:\.\d+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",

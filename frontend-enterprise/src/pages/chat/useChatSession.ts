@@ -349,6 +349,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const modelCatalogRequest = useRef<{ controller: AbortController; valid: boolean } | null>(null);
   const [modelSetupOpen, setModelSetupOpen] = useState(false);
   const [input, setInput] = useState('');
+  const inputRef = useRef('');
+  inputRef.current = input;
   const [slashCommands, setSlashCommands] = useState<ChatSlashCommand[]>([]);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [composerDragActive, setComposerDragActive] = useState(false);
@@ -1249,7 +1251,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         ));
         if (!newScheduledSession || embedded) return;
         autoOpenedSessionIdsRef.current.add(newScheduledSession.id);
-        if (!input.trim()) {
+        if (!inputRef.current.trim()) {
           getSlot(newScheduledSession.id);
           navigate(chatSessionPath(newScheduledSession.id));
         }
@@ -1260,7 +1262,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       .finally(() => {
         setSessionsLoading(false);
       });
-  }, [embedded, getSlot, input, navigate, notifyRequestError, sessionId, tenantId, userId]);
+    // input 走 ref:否则每次击键都会重建 loadSessions,把 2.5s 轮询定时器整个重置
+  }, [embedded, getSlot, navigate, notifyRequestError, sessionId, tenantId, userId]);
 
   const handleMissingSession = useCallback((id: string) => {
     forgetMissingSession(id);
@@ -1757,7 +1760,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   useEffect(() => {
     if (!auth) return;
-    const timer = window.setInterval(loadSessions, 2500);
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      loadSessions();
+    }, 2500);
     return () => window.clearInterval(timer);
   }, [auth, loadSessions]);
 
@@ -1765,6 +1771,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (!auth) return;
     void loadHandoffs();
     const timer = window.setInterval(() => {
+      if (document.hidden) return;
       void loadHandoffs();
     }, 15000);
     return () => window.clearInterval(timer);
@@ -1794,6 +1801,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   useEffect(() => {
     if (!sessionId || runningTurn?.sessionId !== sessionId) return;
     const timer = window.setInterval(() => {
+      if (document.hidden) return;
       void loadMessages(sessionId).finally(() => {
         void loadTraces(sessionId);
       });
@@ -1807,6 +1815,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   useEffect(() => {
     if (!sessionId || !displayedTeamId || runningTurn?.sessionId === sessionId) return;
     const timer = window.setInterval(() => {
+      if (document.hidden) return;
       void loadMessages(sessionId).finally(() => {
         void loadTraces(sessionId);
       });
@@ -1865,15 +1874,24 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       notify.warning('请输入会话名称');
       return;
     }
-    const updated = await api.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
-      tenant_id: tenantId,
-      title,
-    });
-    setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
-    setRenameSession(null);
-    setRenameTitle('');
-    notify.success('已重命名');
-  }, [renameSession, renameTitle, tenantId]);
+    try {
+      const updated = await api.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
+        tenant_id: tenantId,
+        title,
+      });
+      setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      setRenameSession(null);
+      setRenameTitle('');
+      notify.success('已重命名');
+    } catch (error) {
+      if (isAuthError(error)) {
+        redirectToLogin();
+        return;
+      }
+      // 保留对话框与已输入内容,让用户可以重试而不是卡死
+      notify.error(error instanceof Error ? error.message : '重命名失败,请重试');
+    }
+  }, [renameSession, renameTitle, tenantId, redirectToLogin]);
 
   const requestDelete = useCallback((session: ChatSession) => {
     setPendingDelete(session);

@@ -103,6 +103,46 @@ INGEST_STAGES: list[dict[str, Any]] = [
 INGEST_STAGE_BY_KEY = {stage["key"]: stage for stage in INGEST_STAGES}
 logger = logging.getLogger(__name__)
 
+# 进程崩溃等导致永卡 queued/running 的摄取任务:超过该时限即按失败收尾,
+# 否则任务永远显示"进行中"且原始文档 base64 一直留在库里。
+STALE_INGEST_TIMEOUT_MINUTES = 30.0
+
+
+def recover_stale_ingest_jobs(db: Session) -> list[str]:
+    """把超时仍在 queued/running 的摄取任务收尾为 failed,并清理 base64 载荷。"""
+    cutoff = utc_now() - timedelta(minutes=STALE_INGEST_TIMEOUT_MINUTES)
+    stale_jobs = db.exec(
+        select(KnowledgeIngestJob).where(
+            KnowledgeIngestJob.status.in_(["queued", "running"]),
+            KnowledgeIngestJob.updated_at < cutoff,
+        )
+    ).all()
+    recovered: list[str] = []
+    for job in stale_jobs:
+        job.status = "failed"
+        job.stage = "failed"
+        job.error = f"摄取任务超过 {STALE_INGEST_TIMEOUT_MINUTES:g} 分钟未推进,已按失败收尾(进程可能中断)。"
+        job.finished_at = utc_now()
+        job.updated_at = utc_now()
+        metadata = dict(job.metadata_json or {})
+        metadata.pop("content_base64", None)
+        metadata["stage_label"] = "失败"
+        metadata["stage_detail"] = job.error
+        job.metadata_json = metadata
+        if job.document_id:
+            document = db.get(KnowledgeDocument, job.document_id)
+            if document and document.status not in {"ready", "failed"}:
+                document.status = "failed"
+                document.error = job.error
+                document.updated_at = utc_now()
+                db.add(document)
+        db.add(job)
+        recovered.append(job.id)
+    if recovered:
+        db.commit()
+        logger.warning("已收尾 %d 个超时摄取任务: %s", len(recovered), recovered)
+    return recovered
+
 
 @dataclass
 class IngestPayload:
@@ -567,11 +607,22 @@ class KnowledgeService:
             )
             self._clear_embedded_content(job)
         except KnowledgeIngestCancelled as exc:
-            self._finalize_cancelled_job(job, str(exc) or "入库任务已取消")
+            # 先回滚悬挂事务,保证取消落库的写入从干净状态开始
+            self.db.rollback()
+            job = self.db.get(KnowledgeIngestJob, job_id)
+            if job is not None:
+                self._finalize_cancelled_job(job, str(exc) or "入库任务已取消")
         except Exception as exc:  # noqa: BLE001 - persist stable job failure.
+            # 异常可能来自 DB 本身(锁超时/半途 flush):不回滚的话,
+            # 下面这些失败落库写入会在同一坏事务里一起炸,job 永卡 running、
+            # 原始文档 base64 永久留在库里。
+            self.db.rollback()
+            job = self.db.get(KnowledgeIngestJob, job_id)
+            if job is None:
+                return
             if job.document_id:
                 document = self.db.get(KnowledgeDocument, job.document_id)
-                if document:
+                if document and document.status != "ready":
                     document.status = "failed"
                     document.error = str(exc)
                     document.updated_at = utc_now()
@@ -807,10 +858,12 @@ class KnowledgeService:
         with observed_span(
             "knowledge_span", "knowledge.load_chunks", bucket_count=len(selected_ids)
         ) as span:
+            # 限量加载:排序/相关组扩展留足余量(8 倍 + 保底),不再整库载入内存
+            chunk_load_cap = max(int(request.max_chunks) * 8, 200)
             chunks = self._load_chunks_for_buckets(
                 request.tenant_id,
                 selected_ids,
-                None,
+                chunk_load_cap,
             )
             span.finish(candidate_count=len(chunks))
         with observed_span(

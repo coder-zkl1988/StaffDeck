@@ -40,12 +40,11 @@ function renderLogin(onLogin = vi.fn()) {
   return onLogin;
 }
 
-async function showFormAndEnterCredentials(
+async function enterCredentials(
   user: ReturnType<typeof userEvent.setup>,
   username = 'admin',
   password = 'secret',
 ) {
-  await user.click(screen.getByRole('button', { name: '登录' }));
   await user.type(screen.getByLabelText('账号'), username);
   await user.type(screen.getByLabelText('密码'), password);
 }
@@ -57,24 +56,35 @@ afterEach(() => {
 });
 
 describe('LoginPage', () => {
-  it('shows the original landing hero before revealing credentials', async () => {
-    const user = userEvent.setup();
+  it('shows the login form and employee illustration on first render', () => {
     renderLogin();
 
-    expect(screen.getByText('我们来做什么？')).toBeTruthy();
-    expect(screen.getByAltText('StaffDeck 产品预览')).toBeTruthy();
-    expect(screen.queryByLabelText('账号')).toBeNull();
+    expect(screen.getByRole('heading', { name: '登录账户' })).toBeTruthy();
+    expect(screen.getByLabelText('账号')).toBeTruthy();
+    expect(screen.getByLabelText('密码')).toBeTruthy();
+    expect(screen.getByRole('img', {
+      name: '来自运营、销售、开发、客服和数据岗位的数字员工团队',
+    })).toBeTruthy();
+  });
+
+  it('does not request login and shows field errors when credentials are empty', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    renderLogin();
 
     await user.click(screen.getByRole('button', { name: '登录' }));
 
-    expect(screen.getByLabelText('账号')).toBeTruthy();
-    expect(screen.getByLabelText('密码')).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByText('请输入账号')).toBeTruthy();
+    expect(screen.getByText('请输入密码')).toBeTruthy();
+    expect(screen.getByLabelText('账号').getAttribute('aria-invalid')).toBe('true');
+    expect(screen.getByLabelText('密码').getAttribute('aria-invalid')).toBe('true');
   });
 
   it('toggles the password between hidden and visible text', async () => {
     const user = userEvent.setup();
     renderLogin();
-    await user.click(screen.getByRole('button', { name: '登录' }));
     const password = screen.getByLabelText('密码');
 
     expect(password.getAttribute('type')).toBe('password');
@@ -90,7 +100,7 @@ describe('LoginPage', () => {
     vi.stubGlobal('fetch', fetchMock);
     renderLogin();
 
-    await showFormAndEnterCredentials(user, '  admin  ', '  secret  ');
+    await enterCredentials(user, '  admin  ', '  secret  ');
     await user.click(screen.getByRole('button', { name: '登录' }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -109,11 +119,98 @@ describe('LoginPage', () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(session)));
     const onLogin = renderLogin();
 
-    await showFormAndEnterCredentials(user);
+    await enterCredentials(user);
     await user.click(screen.getByRole('button', { name: '登录' }));
 
     await waitFor(() => expect(onLogin).toHaveBeenCalledWith(session));
     expect(JSON.parse(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY) || 'null'))
       .toEqual(session);
+  });
+
+  it('remembers the account only after a successful login', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(session)));
+    renderLogin();
+
+    await enterCredentials(user, 'zongkelong', 'secret');
+    await user.click(screen.getByRole('checkbox', { name: '记住账号' }));
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    await waitFor(() => {
+      expect(window.localStorage.getItem('staffdeck.remembered_username'))
+        .toBe('zongkelong');
+    });
+  });
+
+  it('submits the form when Enter is pressed in a credential field', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse(session));
+    vi.stubGlobal('fetch', fetchMock);
+    renderLogin();
+
+    await enterCredentials(user);
+    await user.keyboard('{Enter}');
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  });
+
+  it('disables submission and shows progress while login is pending', async () => {
+    const user = userEvent.setup();
+    let resolveRequest: ((value: Response) => void) | undefined;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => {
+      resolveRequest = resolve;
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onLogin = renderLogin();
+
+    await enterCredentials(user);
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    const pendingButton = screen.getByRole('button', { name: '登录中…' });
+    expect((pendingButton as HTMLButtonElement).disabled).toBe(true);
+    expect(pendingButton.closest('form')?.getAttribute('aria-busy')).toBe('true');
+
+    resolveRequest?.(jsonResponse(session));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledWith(session));
+  });
+
+  it('shows an API error without storing a session or notifying the caller', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ detail: '账号或密码错误' }, 401)));
+    const onLogin = renderLogin();
+
+    await enterCredentials(user, 'zongkelong', 'wrong-password');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('账号或密码错误');
+    expect(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY)).toBeNull();
+    expect(onLogin).not.toHaveBeenCalled();
+  });
+
+  it('clears the account without changing the password', async () => {
+    const user = userEvent.setup();
+    renderLogin();
+
+    await enterCredentials(user);
+    await user.click(screen.getByRole('button', { name: '清空账号' }));
+
+    expect((screen.getByLabelText('账号') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('密码') as HTMLInputElement).value).toBe('secret');
+  });
+
+  it('forgets a remembered account when the account is cleared', async () => {
+    window.localStorage.setItem('staffdeck.remembered_username', 'zongkelong');
+    const user = userEvent.setup();
+    renderLogin();
+
+    expect((screen.getByLabelText('账号') as HTMLInputElement).value).toBe('zongkelong');
+    expect((screen.getByRole('checkbox', { name: '记住账号' }) as HTMLInputElement).checked)
+      .toBe(true);
+
+    await user.click(screen.getByRole('button', { name: '清空账号' }));
+
+    expect(window.localStorage.getItem('staffdeck.remembered_username')).toBeNull();
+    expect((screen.getByRole('checkbox', { name: '记住账号' }) as HTMLInputElement).checked)
+      .toBe(false);
   });
 });

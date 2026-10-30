@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -335,18 +336,24 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         raw_output: list[str] = []
+        # 取消由 _cancel() 直接 terminate 进程;这里只做低频兜底检查
+        # (任务行被删/数据库态取消),不再每 250ms 开新 Session 轮询。
+        last_db_check = time.monotonic()
         while True:
             if time.monotonic() - started > settings.codex_a2a_timeout_seconds:
                 process.terminate()
                 raise TimeoutError("Codex CLI A2A task timed out.")
-            with Session(engine) as db:
-                current_task = db.get(A2ATaskRun, task_id)
-                if current_task is None:
-                    process.terminate()
-                    return
-                if current_task.cancel_requested:
-                    process.terminate()
-                    raise RuntimeError("Codex CLI A2A task was cancelled.")
+            now_mono = time.monotonic()
+            if now_mono - last_db_check >= 5.0:
+                last_db_check = now_mono
+                with Session(engine) as db:
+                    current_task = db.get(A2ATaskRun, task_id)
+                    if current_task is None:
+                        process.terminate()
+                        return
+                    if current_task.cancel_requested:
+                        process.terminate()
+                        raise RuntimeError("Codex CLI A2A task was cancelled.")
             try:
                 line = output_queue.get(timeout=0.25)
             except queue.Empty:
@@ -681,6 +688,38 @@ def _workspace_snapshot(root: Path) -> dict[str, tuple[int, int]]:
         for path in root.rglob("*")
         if path.is_file() and ".git" not in path.parts
     }
+
+
+def cleanup_stale_codex_workspaces(*, retention_days: float | None = None) -> int:
+    """删除超过保留期的 Codex A2A 工作区目录(产物仅存元数据,目录会无限累积)。
+
+    返回删除的目录数;保留期由 settings.codex_a2a_workspace_retention_days 控制。
+    """
+    settings = get_settings()
+    root = Path(settings.codex_a2a_workspace_root or "/tmp/staffdeck-codex-a2a")
+    if not root.is_dir():
+        return 0
+    days = (
+        retention_days
+        if retention_days is not None
+        else settings.codex_a2a_workspace_retention_days
+    )
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400.0
+    removed = 0
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        try:
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _collect_artifacts(root: Path, before: dict[str, tuple[int, int]]) -> list[dict[str, Any]]:

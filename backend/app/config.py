@@ -3,22 +3,15 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_APP_SECRET = "change-me-in-development"
+
 
 class Settings(BaseSettings):
-    lark_cli_enabled: bool = True
-    lark_cli_auto_install: bool = True
-    lark_cli_binary_path: str = ""
-    package_source_root: str = ''
-    package_engine_root: str = ''
-    package_state_dir: str = ''
-    package_module_sources: dict[str, str] = {}
-    package_config_files: dict[str, str] = {}
-    package_worker_token: str = ''
-    demo_seed_enabled: bool = True
-    startup_orphan_cleanup_enabled: bool = True
     app_name: str = "Skill Agent Loop Service"
     database_url: str = "sqlite:///./skill_agent_loop.db"
-    app_secret: str = "change-me-in-development"
+    app_secret: str = DEFAULT_APP_SECRET
+    # production 时默认 APP_SECRET 会直接拒绝启动;development 仅告警。
+    app_env: str = "development"
     demo_model_base_url: str = "http://localhost:52010/v1"
     demo_model_name: str = "qwen3.6-27b"
     demo_model_api_key: str = ""
@@ -35,6 +28,16 @@ class Settings(BaseSettings):
     codex_a2a_workspace_root: str = ""
     codex_a2a_timeout_seconds: float = 1800.0
     codex_a2a_token: str = ""
+    # 飞书官方 lark-cli 集成（app/lark_cli/）。开启即进入能力清单；应用凭据
+    # 与用户登录都在对话中完成（config init / auth login 设备码），无需预置
+    # 配置或飞书渠道绑定。
+    lark_cli_enabled: bool = True
+    # 二进制供给见 lark_cli/provision.py：懒加载（首次调用时装，非启动时），
+    # 装到用户数据目录。关掉自动安装则必须自备二进制并指定 binary_path。
+    lark_cli_auto_install: bool = True
+    lark_cli_binary_path: str = ""
+    # Codex A2A 工作区保留天数(启动时清理超期目录);<=0 关闭清理
+    codex_a2a_workspace_retention_days: float = 7.0
     tool_base_url: str = "http://localhost:5173"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     general_skill_runtime_python: str = ""
@@ -49,11 +52,6 @@ class Settings(BaseSettings):
     general_skill_network_install: bool = True
     channel_secret: str = ""
     staffdeck_role: str = "all"
-
-    # Which SPA single_port_app serves at its web routes. Both SPAs are built with
-    # the same base path, so the choice is a serving decision, not a build one.
-    # "releases" = frontend-enterprise, "business" = staffdeck business SPA.
-    staffdeck_ui_variant: str = "releases"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
     channel_delivery_poll_seconds: float = 1.0
     channel_delivery_max_attempts: int = 8
@@ -79,54 +77,18 @@ class Settings(BaseSettings):
     # 回滚为逐行展示的旧样式；binding 的 config_json.compact_trace=false 可对单个
     # 绑定回滚。
     channel_feishu_trace_compact_sop: bool = True
-    # Legacy configuration fields are read for migration, not engine selection.
-    # Runtime assembly always enables the registered v3 engine.
-    harness_v3_enabled: bool = True
-    # Exposes /api/enterprise/harness (module registry, snapshot preview, ledger
-    # reconciliation, per-staff engine) even when turns still run on legacy, so
-    # operators can inspect the pluggable tree before switching engines.
-    harness_admin_api_enabled: bool = True
-    # Comma-separated module ids to disable, and extra "pkg.mod:register" specs.
-    harness_disabled_modules: str = ""
-    harness_modules: str = ""
-    # Admin-editable overrides (engine / security profile / disabled / extra modules);
-    # defaults to <harness_v3_home or cwd>/staffdeck-runtime.json.
-    harness_runtime_config_path: str = ""
-    # Where the admin page may point the enterprise permission centre. Comma-separated host[:port]
-    # patterns (fnmatch, e.g. "*.corp.example,10.0.*"); empty = loopback / private ranges only.
-    # Set to "*" to allow any host. https is required for public hosts.
-    base_url_allowlist: str = ""
-    harness_v3_root: str = ""
-    harness_v3_home: str = ""
-    harness_v3_node_bin: str = "node"
-    harness_v3_permission_mode: str = "danger-full-access"
-    harness_v3_staff_allowlist: str = ""
-    harness_v3_fallback_to_v2: bool = False  # deprecated; no execution path reads this switch
-    # Comma-separated tenant ids whose *admins* may mutate process-global runtime state
-    # (assembly config, restart, module placement/install, permission-centre test). Empty means
-    # the deployment is treated as single-operator: the tenant of the acting admin may change the
-    # runtime. Set this when multiple tenants share one process; without it, each tenant's admin
-    # would be able to change the engine/profile for everyone.
-    harness_operator_tenants: str = ""
-    harness_v3_initialize_timeout_seconds: float = 90.0
-    harness_v3_request_timeout_seconds: float = 600.0
-    # OSS_LOCAL or BUSINESS_BASE; one per deployment.
-    security_profile: str = "OSS_LOCAL"
-    harness_module_selections: dict[str, str] = {}
-    harness_enabled_modules: str = ""
-    harness_module_configs: dict[str, dict[str, object]] = {}
-    harness_presets_dir: str = ""
-    # Deployment-only; never changed by runtime presets or module enable/disable.
-    harness_control_auth_provider: str = ""
-    base_authz_url: str = ""
-    base_authz_decision_token: str = ""
-    base_authz_control_token: str = ""
-    base_authz_timeout_seconds: float = 3.0
-    base_authz_pending_timeout_seconds: float = 3.0
-    base_identity_internal_url: str = ""
-    base_identity_runtime_client_id: str = "agent-platform-runtime"
-    base_identity_runtime_client_secret: str = ""
-    base_workload_identity_audience: str = "staffdeck-gateway"
+    # mock 演示 API(/api/mock/*)挂载开关:生产环境建议关闭。
+    mock_api_enabled: bool = True
+    # 成员可用「探测/adhoc 发现」路径的 stdio 命令白名单(按可执行文件名匹配)。
+    # 保存的 MCP server 由管理员维护,不受此白名单约束。
+    mcp_stdio_allowed_commands: str = "npx,uvx,uv,node,python,python3,deno,bun,docker"
+    # 工具探测(成员可用路径)的目标 URL 与超时约束:
+    # 默认拒绝内网/保留地址(防 SSRF),允许 tool_base_url 自身;
+    # 内网工具部署可通过该开关放行。
+    tool_probe_allow_private_networks: bool = False
+    tool_probe_max_timeout_seconds: float = 30.0
+    # 观测表(agent_events/channel_deliveries/a2a_task_events)保留天数;<=0 关闭清理
+    observability_retention_days: int = 14
 
     model_config = SettingsConfigDict(
         env_file=_os.environ.get("ULTRARAG_DOTENV", ".env"),
@@ -136,6 +98,22 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() == "production"
+
+    @property
+    def app_secret_is_default(self) -> bool:
+        return not self.app_secret or self.app_secret == DEFAULT_APP_SECRET
+
+    @property
+    def mcp_stdio_allowed_command_list(self) -> list[str]:
+        return [
+            item.strip().lower()
+            for item in self.mcp_stdio_allowed_commands.split(",")
+            if item.strip()
+        ]
 
     @property
     def normalized_tool_base_url(self) -> str:

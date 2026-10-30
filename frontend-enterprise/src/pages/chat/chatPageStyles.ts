@@ -249,9 +249,17 @@ export const CHAT_COMPOSER_COMMAND_KIND_CLASS =
   'shrink-0 rounded-full bg-[#e9edf2] px-[6px] py-px text-[9px] font-medium leading-[1.4] text-[#687184]';
 export const CHAT_COMPOSER_COMMAND_REMOVE_CLASS =
   'inline-grid size-[18px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[15px] leading-none text-[#9aa1af] transition-colors hover:bg-[#18181a] hover:text-white focus-visible:bg-[#18181a] focus-visible:text-white focus-visible:outline-none';
-export const CHAT_COMPOSER_ATTACHMENTS_CLASS = 'flex flex-wrap gap-[8px]';
+export const CHAT_COMPOSER_ATTACHMENTS_SHELL_CLASS = 'relative min-w-0 max-w-full overflow-hidden';
+export const CHAT_COMPOSER_ATTACHMENTS_CLASS =
+  'flex min-w-0 max-w-full flex-nowrap gap-[8px] overflow-x-auto overflow-y-hidden overscroll-x-contain [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden';
+export const CHAT_COMPOSER_ATTACHMENT_FADE_CLASS =
+  'pointer-events-none absolute inset-y-0 z-10 w-[28px]';
+export const CHAT_COMPOSER_ATTACHMENT_FADE_LEFT_CLASS =
+  'left-0 bg-gradient-to-r from-white via-white/90 to-transparent';
+export const CHAT_COMPOSER_ATTACHMENT_FADE_RIGHT_CLASS =
+  'right-0 bg-gradient-to-l from-white via-white/90 to-transparent';
 export const CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS =
-  'inline-flex max-w-[240px] items-center gap-[7px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] py-[5px] pl-[7px] pr-[6px] text-[12px] text-[#464c5e]';
+  'inline-flex max-w-[240px] shrink-0 items-center gap-[7px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] py-[5px] pl-[7px] pr-[6px] text-[12px] text-[#464c5e]';
 export const CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS = 'border-[#f38989] bg-[#fce7e7] text-[#d20b0b]';
 export const CHAT_COMPOSER_ATTACHMENT_IMG_CLASS = 'size-[24px] rounded-[6px] object-cover';
 export const CHAT_COMPOSER_ATTACHMENT_COPY_CLASS = 'grid min-w-0 gap-px';

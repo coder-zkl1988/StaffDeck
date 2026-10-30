@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -7,7 +7,7 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
-import { api, isAuthError, TENANT_ID } from "./api/client";
+import { api, isAuthError, TENANT_ID, UNAUTHORIZED_EVENT } from "./api/client";
 import {
   clearEnterpriseAuthSession,
   getEnterpriseAuthSession,
@@ -37,41 +37,63 @@ import {
   employeeProfile,
   preferredEmployeeAgent,
 } from "./employee";
-import AccountsPage from "./pages/AccountsPage";
-import AgentsPage from "./pages/AgentsPage";
-import ChannelsPage from "./pages/ChannelsPage";
 import ChatPage from "./pages/chat/ChatPage";
-import ChatGalleryPage from "./pages/chat/ChatGalleryPage";
-import DashboardPage from "./pages/dashboard/DashboardPage";
-import { loadEmployeeDirectory } from './api/employee-directory';
 import EmptyEmployeeState from "./components/EmptyEmployeeState";
-import DistillPage from "./pages/DistillPage";
-import GeneralSkillsPage, {
-  GeneralSkillEditPage,
-  GeneralSkillNewPage,
-} from "./pages/GeneralSkillsPage";
-import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
 import LoginPage from "./pages/LoginPage";
-import ModelsPage from "./pages/ModelsPage";
-import RuntimeSettingsPage from "./pages/RuntimeSettingsPage";
-import AdminPage from "./pages/admin/AdminPage";
-import OpenPlatformPage from "./pages/OpenPlatformPage";
-import PersonaPage from "./pages/PersonaPage";
-import SkillsPage from "./pages/SkillsPage";
-import TeamChatPage from "./pages/TeamChatPage";
-import TeamDetailPage from "./pages/TeamDetailPage";
-import TeamsPage from "./pages/TeamsPage";
-import {
-  ScheduledTaskEditPage,
-  ScheduledTaskNewPage,
-} from "./pages/dashboard/ScheduledTasksTab";
-import ToolsPage, {
-  McpServerEditPage,
-  McpServerNewPage,
-  ToolEditPage,
-  ToolNewPage,
-  ToolTestPage,
-} from "./pages/ToolsPage";
+
+// 路由级代码分割:企业页按需加载,避免全部页面(含 8k+ 行的 DistillPage)
+// 常驻主包;Chat/Login 保持同步加载以保证首屏与工作区启动延迟不变。
+const AccountsPage = lazy(() => import("./pages/AccountsPage"));
+const AgentsPage = lazy(() => import("./pages/AgentsPage"));
+const ChannelsPage = lazy(() => import("./pages/ChannelsPage"));
+const ChatGalleryPage = lazy(() => import("./pages/chat/ChatGalleryPage"));
+const DashboardPage = lazy(() => import("./pages/dashboard/DashboardPage"));
+const DistillPage = lazy(() => import("./pages/DistillPage"));
+const GeneralSkillsPage = lazy(() => import("./pages/GeneralSkillsPage"));
+const GeneralSkillEditPage = lazy(() =>
+  import("./pages/GeneralSkillsPage").then((m) => ({ default: m.GeneralSkillEditPage })),
+);
+const GeneralSkillNewPage = lazy(() =>
+  import("./pages/GeneralSkillsPage").then((m) => ({ default: m.GeneralSkillNewPage })),
+);
+const KnowledgeManagePage = lazy(() => import("./pages/KnowledgePage"));
+const KnowledgeAddPage = lazy(() =>
+  import("./pages/KnowledgePage").then((m) => ({ default: m.KnowledgeAddPage })),
+);
+const ModelsPage = lazy(() => import("./pages/ModelsPage"));
+const RuntimeSettingsPage = lazy(() => import("./pages/RuntimeSettingsPage"));
+const OpenPlatformPage = lazy(() => import("./pages/OpenPlatformPage"));
+const PersonaPage = lazy(() => import("./pages/PersonaPage"));
+const SkillsPage = lazy(() => import("./pages/SkillsPage"));
+const TeamChatPage = lazy(() => import("./pages/TeamChatPage"));
+const TeamDetailPage = lazy(() => import("./pages/TeamDetailPage"));
+const TeamsPage = lazy(() => import("./pages/TeamsPage"));
+const ScheduledTaskEditPage = lazy(() =>
+  import("./pages/dashboard/ScheduledTasksTab").then((m) => ({
+    default: m.ScheduledTaskEditPage,
+  })),
+);
+const ScheduledTaskNewPage = lazy(() =>
+  import("./pages/dashboard/ScheduledTasksTab").then((m) => ({
+    default: m.ScheduledTaskNewPage,
+  })),
+);
+const ToolsPage = lazy(() => import("./pages/ToolsPage"));
+const McpServerEditPage = lazy(() =>
+  import("./pages/ToolsPage").then((m) => ({ default: m.McpServerEditPage })),
+);
+const McpServerNewPage = lazy(() =>
+  import("./pages/ToolsPage").then((m) => ({ default: m.McpServerNewPage })),
+);
+const ToolEditPage = lazy(() =>
+  import("./pages/ToolsPage").then((m) => ({ default: m.ToolEditPage })),
+);
+const ToolNewPage = lazy(() =>
+  import("./pages/ToolsPage").then((m) => ({ default: m.ToolNewPage })),
+);
+const ToolTestPage = lazy(() =>
+  import("./pages/ToolsPage").then((m) => ({ default: m.ToolTestPage })),
+);
 import { useIsMobile } from "./hooks/use-mobile";
 import {
   Dialog,
@@ -158,7 +180,6 @@ function Shell({
   const isAdmin = isEnterpriseAdmin(auth.user);
   const accountRoleLabel = isAdmin ? "管理员" : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
-  const [distillVisited, setDistillVisited] = useState(isDistillRoute);
   const selected =
     location.pathname === "/enterprise"
       ? "/enterprise/dashboard"
@@ -189,7 +210,6 @@ function Shell({
 
   useEffect(() => {
     if (isDistillRoute) {
-      setDistillVisited(true);
       setLastDistillSearch(location.search);
     }
   }, [isDistillRoute, location.search]);
@@ -301,7 +321,8 @@ function Shell({
   }
 
   function loadAgents(preferredAgentId = "") {
-    return loadEmployeeDirectory()
+    return api
+      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
       .then((rows) => {
         setAgents(rows);
         const selectableRows = rows.filter((item) => canUseAgentScope(item));
@@ -426,17 +447,9 @@ function Shell({
       return;
     }
     const isBlankOnboarding = agentForm.sourceMode === "blank";
-    let sourceAgent = agentForm.copyFromAgentId
+    const sourceAgent = agentForm.copyFromAgentId
       ? sourceAgents.find((item) => item.id === agentForm.copyFromAgentId)
       : undefined;
-    if (!isBlankOnboarding && sourceAgent?.metadata?.directory_summary) {
-      try {
-        sourceAgent = await api.get<AgentProfileRead>(`/api/enterprise/agents/${encodeURIComponent(sourceAgent.id)}?tenant_id=${TENANT_ID}`);
-      } catch (error) {
-        notify.error(error instanceof Error ? error.message : '员工详情加载失败');
-        return;
-      }
-    }
     const sourceMetadata =
       !isBlankOnboarding && sourceAgent?.metadata ? sourceAgent.metadata : {};
     const sourceRoleName =
@@ -490,7 +503,6 @@ function Shell({
       await loadAgents();
       changeAgentScope(created.id);
       setAgentCreateOpen(false);
-      window.dispatchEvent(new Event("ultrarag-enterprise-agent-scope-refresh"));
       notify.success("数字员工创建成功");
     } catch (error) {
       notify.error(error instanceof Error ? error.message : "创建数字员工失败");
@@ -555,7 +567,7 @@ function Shell({
               )}
             </div>
           )}
-          {(isDistillRoute || distillVisited) && <div
+          <div
             className={
               isDistillRoute
                 ? "persistent-distill active flex min-h-0 flex-1 flex-col"
@@ -568,7 +580,7 @@ function Shell({
               currentUser={auth.user}
               onLogout={onLogout}
             />
-          </div>}
+          </div>
           {!isDistillRoute && showEmployeeEmptyState && (
             <EmptyEmployeeState
               isAdmin={isAdmin}
@@ -577,6 +589,13 @@ function Shell({
             />
           )}
           {!isDistillRoute && !showEmployeeEmptyState && (
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-[13px] text-muted-foreground">
+                  正在加载页面…
+                </div>
+              }
+            >
             <Routes>
               <Route
                 path="/enterprise"
@@ -836,6 +855,7 @@ function Shell({
                 element={<Navigate to="/enterprise/dashboard" replace />}
               />
             </Routes>
+            </Suspense>
           )}
         </div>
       </div>
@@ -1015,26 +1035,29 @@ function AuthedApp({
     const nextPath = location.pathname.replace(/^\/enterprise\/chat/, EnterpriseRoute.Chat);
     return <Navigate to={`${nextPath}${location.search}`} replace />;
   }
-  if (location.pathname === EnterpriseRoute.Admin || location.pathname.startsWith(`${EnterpriseRoute.Admin}/`)) {
-    return isEnterpriseAdmin(auth.user)
-      ? <AdminPage currentUser={auth.user} onLogout={onLogout} />
-      : <Navigate to={EnterpriseRoute.Gallery} replace />;
-  }
   if (location.pathname.startsWith(EnterpriseRoute.Workspace)) {
     return (
-      <Routes>
-        <Route
-          path="/workspace"
-          element={<Navigate to="/workspace/gallery" replace />}
-        />
-        <Route path="/workspace/gallery" element={<ChatGalleryPage />} />
-        <Route path="/workspace/chat" element={<ChatPage />} />
-        <Route
-          path="/workspace/chat/draft/:draftAgentId"
-          element={<ChatPage />}
-        />
-        <Route path="/workspace/chat/:sessionId" element={<ChatPage />} />
-      </Routes>
+      <Suspense
+        fallback={
+          <div className="flex h-full items-center justify-center text-[13px] text-muted-foreground">
+            正在加载页面…
+          </div>
+        }
+      >
+        <Routes>
+          <Route
+            path="/workspace"
+            element={<Navigate to="/workspace/gallery" replace />}
+          />
+          <Route path="/workspace/gallery" element={<ChatGalleryPage />} />
+          <Route path="/workspace/chat" element={<ChatPage />} />
+          <Route
+            path="/workspace/chat/draft/:draftAgentId"
+            element={<ChatPage />}
+          />
+          <Route path="/workspace/chat/:sessionId" element={<ChatPage />} />
+        </Routes>
+      </Suspense>
     );
   }
   return <Shell auth={auth} onLogout={onLogout} guidesCompleted={guidesCompleted} />;
@@ -1059,6 +1082,17 @@ export default function App() {
     return () => window.removeEventListener(QUICK_START_COMPLETED_EVENT, onQuickStartCompleted);
   }, []);
 
+  // 任意 API 返回 401(token 过期/被吊销)时统一登出,企业页不再静默失败
+  useEffect(() => {
+    const onUnauthorized = () => {
+      clearEnterpriseAuthSession();
+      setAuth(null);
+      setAuthChecked(true);
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
   useEffect(() => {
     if (!auth?.token) {
       setAuthChecked(true);
@@ -1069,7 +1103,7 @@ export default function App() {
     void api.get<EnterpriseAuthUser>("/api/auth/me")
       .then((user) => {
         if (cancelled) return;
-        const refreshed = { token: getEnterpriseAuthSession()?.token || auth.token, user };
+        const refreshed = { token: auth.token, user };
         setEnterpriseAuthSession(refreshed);
         setAuth(refreshed);
         setAuthChecked(true);
@@ -1088,7 +1122,6 @@ export default function App() {
   }, [auth?.token]);
 
   function logout() {
-    void api.post('/api/auth/logout').catch(() => undefined);
     clearEnterpriseAuthSession();
     setAuth(null);
     setAuthChecked(true);
@@ -1096,7 +1129,7 @@ export default function App() {
 
   return (
     <TooltipProvider>
-      <BrowserRouter basename={import.meta.env.BASE_URL}>
+      <BrowserRouter>
         <Routes>
           <Route
             path="/*"

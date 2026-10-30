@@ -52,6 +52,8 @@ LEASE_SECONDS = 15 * 60
 WORKER_SLEEP_SECONDS = 5
 MISFIRE_GRACE_SECONDS = max(30, WORKER_SLEEP_SECONDS * 2)
 CONFLICT_RETRY_SECONDS = 15
+# 同一 run 的 turn 冲突重试上限;超过即显式失败,避免每 15s 永久空转
+MAX_CONFLICT_RETRIES = 5
 SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
@@ -561,10 +563,12 @@ def _execute_prepared_scheduled_task(
             client_timezone=task.timezone,
         )
         result: ChatTurnResponse | None = None
+        stream_writer = _ScheduledTaskStreamWriter(db, run, run.session_id)
         for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
-            _record_scheduled_task_stream_event(db, run, run.session_id, seq, item)
+            stream_writer.record(seq, item)
             if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
                 result = ChatTurnResponse.model_validate(item["data"])
+        stream_writer.flush()
         if result is None:
             raise RuntimeError("自动任务执行未返回完整结果")
         outcome = _scheduled_harness_outcome(db, run, result)
@@ -575,11 +579,22 @@ def _execute_prepared_scheduled_task(
         run.finished_at = utc_now()
         _finish_task_schedule(db, task, run.scheduled_for, run.status, manual)
     except HarnessTurnConflict as exc:
-        run.status = "retrying"
-        run.error = str(exc)
-        run.finished_at = None
-        if not manual:
-            task.next_run_at = utc_now() + timedelta(seconds=CONFLICT_RETRY_SECONDS)
+        # 冲突通常是暂态的(同会话仍有在途 turn),但不可恢复的 turn 记录会
+        # 让重试永久空转:超过上限后显式失败,把问题暴露给用户。
+        run.retry_count += 1
+        if run.retry_count > MAX_CONFLICT_RETRIES:
+            run.status = "failed"
+            run.error = (
+                f"会话 turn 冲突重试 {MAX_CONFLICT_RETRIES} 次后放弃:{exc}"
+            )
+            run.finished_at = utc_now()
+            _finish_task_schedule(db, task, run.scheduled_for, "failed", manual)
+        else:
+            run.status = "retrying"
+            run.error = str(exc)
+            run.finished_at = None
+            if not manual:
+                task.next_run_at = utc_now() + timedelta(seconds=CONFLICT_RETRY_SECONDS)
     except Exception as exc:
         run.status = "failed"
         run.error = str(exc)
@@ -811,6 +826,89 @@ def _scheduled_sop_specific_capabilities(
     return [capabilities[key] for key in sorted(capabilities)]
 
 
+SCHEDULED_EVENT_COMMIT_BATCH = 25
+
+
+class _ScheduledTaskStreamWriter:
+    """定时任务流事件批量落库。
+
+    每个流式 delta 一次 SELECT(receipt)+INSERT+commit 会带来数百次 WAL fsync;
+    这里把 turn 解析缓存、事件缓冲,按批提交,终态事件即时落库。
+    """
+
+    def __init__(self, db: Session, run: ScheduledTaskRun, session_id: str) -> None:
+        self._db = db
+        self._run = run
+        self._session_id = session_id
+        self._buffered = 0
+        self._turn_id = ""
+
+    def record(self, seq: int, item: dict[str, Any]) -> None:
+        event = str(item.get("event") or "")
+        data = item.get("data")
+        if not isinstance(data, dict):
+            data = {"value": data}
+        payload = dict(data)
+        payload.setdefault("sessionId", self._session_id)
+        if not self._turn_id or self._buffered == 0:
+            self._turn_id = self._resolve_turn_id(payload)
+        turn_id = self._turn_id
+        if turn_id:
+            payload.setdefault("turn_id", turn_id)
+            payload.setdefault("user_message_id", turn_id)
+        payload.setdefault("client_turn_id", self._run.id)
+        self._db.add(
+            AgentEvent(
+                tenant_id=self._run.tenant_id,
+                session_id=self._session_id,
+                event_type="scheduled_task_stream_event",
+                payload_json={
+                    "run_id": self._run.id,
+                    "seq": seq,
+                    "event": event,
+                    "turn_id": turn_id or None,
+                    "user_message_id": turn_id or None,
+                    "client_turn_id": self._run.id,
+                    "data": payload,
+                },
+                created_at=utc_now(),
+            )
+        )
+        self._buffered += 1
+        if self._buffered >= SCHEDULED_EVENT_COMMIT_BATCH or event in {
+            "complete",
+            "done",
+            "error",
+        }:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buffered:
+            return
+        self._run.updated_at = utc_now()
+        self._db.add(self._run)
+        self._db.commit()
+        self._buffered = 0
+
+    def _resolve_turn_id(self, payload: dict[str, Any]) -> str:
+        candidate = str(
+            payload.get("turn_id")
+            or payload.get("turnId")
+            or payload.get("user_message_id")
+            or ""
+        ).strip()
+        if candidate:
+            return candidate
+        receipt = self._db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.tenant_id == self._run.tenant_id,
+                HarnessTurnRecord.session_id == self._session_id,
+                HarnessTurnRecord.client_turn_id == self._run.id,
+            )
+        ).first()
+        return str(receipt.user_message_id).strip() if receipt else ""
+
+
 def _record_scheduled_task_stream_event(
     db: Session,
     run: ScheduledTaskRun,
@@ -818,49 +916,9 @@ def _record_scheduled_task_stream_event(
     seq: int,
     item: dict[str, Any],
 ) -> None:
-    event = str(item.get("event") or "")
-    data = item.get("data")
-    if not isinstance(data, dict):
-        data = {"value": data}
-    payload = dict(data)
-    payload.setdefault("sessionId", session_id)
-    receipt = db.exec(
-        select(HarnessTurnRecord).where(
-            HarnessTurnRecord.tenant_id == run.tenant_id,
-            HarnessTurnRecord.session_id == session_id,
-            HarnessTurnRecord.client_turn_id == run.id,
-        )
-    ).first()
-    turn_id = str(
-        payload.get("turn_id")
-        or payload.get("turnId")
-        or payload.get("user_message_id")
-        or (receipt.user_message_id if receipt else "")
-    ).strip()
-    if turn_id:
-        payload.setdefault("turn_id", turn_id)
-        payload.setdefault("user_message_id", turn_id)
-    payload.setdefault("client_turn_id", run.id)
-    db.add(
-        AgentEvent(
-            tenant_id=run.tenant_id,
-            session_id=session_id,
-            event_type="scheduled_task_stream_event",
-            payload_json={
-                "run_id": run.id,
-                "seq": seq,
-                "event": event,
-                "turn_id": turn_id or None,
-                "user_message_id": turn_id or None,
-                "client_turn_id": run.id,
-                "data": payload,
-            },
-            created_at=utc_now(),
-        )
-    )
-    run.updated_at = utc_now()
-    db.add(run)
-    db.commit()
+    writer = _ScheduledTaskStreamWriter(db, run, session_id)
+    writer.record(seq, item)
+    writer.flush()
 
 
 def automatic_task_message(task: ScheduledTask) -> str:

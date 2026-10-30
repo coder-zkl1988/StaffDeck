@@ -9,7 +9,6 @@ from typing import Any, Callable
 import httpx
 
 from app.channels.adapters.base import (
-    ManagedIngressLifecycle,
     CHANNEL_TEXT_LIMIT,
     ChannelInboundAttachment,
     register_channel_adapter,
@@ -50,22 +49,29 @@ class FeishuTransientError(FeishuSendError):
     retryable = True
 
 
-class FeishuCredentialError(FeishuPermanentError):
-    def __init__(self, message: str, *, code: str, stage: str, provider_code: int | None = None):
-        # Never include provider message/body: it may echo submitted credentials.
-        super().__init__(message + (f"（飞书错误码 {provider_code}）" if provider_code is not None else ""))
-        self.code, self.stage, self.provider_code = code, stage, provider_code
+class _PooledHttpClient(httpx.Client):
+    """跨请求复用的客户端:with 块退出时不关闭,连接池由进程生命周期统一回收。"""
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
-def feishu_binding_ready(binding: ChannelBinding) -> bool:
-    config = binding.config_json or {}
-    return bool(binding.credentials_enc and str(config.get('app_id') or '').strip()
-                and str(config.get('bot_open_id') or '').strip())
+_pooled_clients: dict[float, _PooledHttpClient] = {}
+_pooled_clients_guard = threading.Lock()
+
+
+def _borrow_pooled_client(timeout_seconds: float) -> _PooledHttpClient:
+    with _pooled_clients_guard:
+        client = _pooled_clients.get(timeout_seconds)
+        if client is None or client.is_closed:
+            client = _PooledHttpClient(timeout=timeout_seconds)
+            _pooled_clients[timeout_seconds] = client
+        return client
 
 
 class FeishuTokenProvider:
     def __init__(self, *, client_factory: Callable[[], httpx.Client] | None = None):
-        self._client_factory = client_factory or (lambda: httpx.Client(timeout=10.0))
+        self._client_factory = client_factory or (lambda: _borrow_pooled_client(10.0))
         self._cache: dict[tuple[str, str, int], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._key_locks: dict[tuple[str, str, int], threading.Lock] = {}
@@ -141,13 +147,6 @@ def validate_feishu_credentials(
     client_factory: Callable[[], httpx.Client] | None = None,
 ) -> dict[str, str]:
     factory = client_factory or (lambda: httpx.Client(timeout=10.0))
-    def response_code(data):
-        if not isinstance(data, dict):
-            raise FeishuTransientError("飞书凭证校验响应格式异常")
-        try:
-            return int(data.get('code', -1))
-        except (TypeError, ValueError):
-            raise FeishuTransientError("飞书凭证校验响应格式异常") from None
     try:
         with factory() as client:
             token_response = client.post(
@@ -155,18 +154,15 @@ def validate_feishu_credentials(
                 json={"app_id": app_id, "app_secret": app_secret},
             )
             token_data = token_response.json()
-            token_code = response_code(token_data)
             token = str(token_data.get("tenant_access_token") or "").strip()
             if token_response.status_code == 429 or token_response.status_code >= 500:
                 raise FeishuTransientError("飞书 token 服务暂时不可用")
             if (
                 token_response.status_code >= 400
-                or token_code != 0
+                or int(token_data.get("code", -1)) != 0
+                or not token
             ):
-                raise FeishuCredentialError("飞书拒绝应用凭证校验，请核对同一应用的 App ID 与 App Secret",
-                    code="FEISHU_CREDENTIALS_REJECTED", stage="tenant_token", provider_code=token_code)
-            if not token:
-                raise FeishuTransientError("飞书 token 响应缺少必要字段")
+                raise FeishuPermanentError("飞书应用凭证无效或无权限")
             bot_response = client.get(
                 f"{FEISHU_API_BASE}/bot/v3/info/",
                 headers={"Authorization": f"Bearer {token}"},
@@ -178,25 +174,16 @@ def validate_feishu_credentials(
         raise FeishuTransientError("无法验证飞书应用凭证") from exc
     if bot_response.status_code == 429 or bot_response.status_code >= 500:
         raise FeishuTransientError("飞书机器人信息服务暂时不可用")
-    bot_code = response_code(bot_data)
-    if bot_response.status_code >= 400 or bot_code != 0:
-        raise FeishuCredentialError("飞书拒绝读取机器人信息，请检查应用的机器人配置和权限",
-            code="FEISHU_BOT_INFO_REJECTED", stage="bot_info", provider_code=bot_code)
+    if bot_response.status_code >= 400 or int(bot_data.get("code", -1)) != 0:
+        raise FeishuPermanentError("无法读取飞书机器人信息，请检查应用权限")
     bot = bot_data.get("bot") or {}
     open_id = str(bot.get("open_id") or "").strip()
     if not open_id:
-        raise FeishuCredentialError("飞书机器人信息缺少 open_id，请检查应用的机器人配置",
-            code="FEISHU_BOT_ID_MISSING", stage="bot_info")
+        raise FeishuPermanentError("飞书机器人信息缺少 open_id")
     return {"bot_open_id": open_id, "bot_name": str(bot.get("app_name") or "").strip()}
 
 
-class FeishuAdapter(ManagedIngressLifecycle):
-    handoff_reply_hint = "如需答复，请直接回复本条消息（引用后输入答复内容）；也可发送 /回复反馈 <答复内容>。"
-
-    @staticmethod
-    def handoff_target(external_user_id: str, handoff_id: str) -> dict[str, Any]:
-        return {"receive_id_type": "open_id", "receive_id": external_user_id, "handoff_id": handoff_id}
-
+class FeishuAdapter:
     # 飞书 reaction 会返回远端 reaction_id，重复挂会产生第二个表情，因此重试前必须
     # 先用 find_own_reaction() 回查，不能直接重发。
     reaction_attach_idempotent = False
@@ -208,7 +195,7 @@ class FeishuAdapter(ManagedIngressLifecycle):
         token_provider: FeishuTokenProvider | None = None,
         client_factory: Callable[[], httpx.Client] | None = None,
     ):
-        self._client_factory = client_factory or (lambda: httpx.Client(timeout=15.0))
+        self._client_factory = client_factory or (lambda: _borrow_pooled_client(15.0))
         self._tokens = token_provider or FeishuTokenProvider(client_factory=self._client_factory)
 
     def normalize(self, raw: dict[str, Any]):
@@ -622,10 +609,15 @@ class FeishuAdapter(ManagedIngressLifecycle):
             created_message_id = str((data.get("data") or {}).get("message_id") or "").strip() or None
         return created_message_id
 
-    def ingress_manager(self):
+    def start_ingress(self, binding_id: str) -> None:
         from app.channels import get_feishu_process_manager
 
-        return get_feishu_process_manager()
+        get_feishu_process_manager().ensure_binding(binding_id)
+
+    def stop_ingress(self, binding_id: str) -> None:
+        from app.channels import get_feishu_process_manager
+
+        get_feishu_process_manager().stop_binding(binding_id)
 
 
 register_channel_adapter("feishu", FeishuAdapter())

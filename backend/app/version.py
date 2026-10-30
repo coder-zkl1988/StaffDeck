@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_APP_VERSION = "0.1.0"
+DEFAULT_APP_VERSION = "0.5.1"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 

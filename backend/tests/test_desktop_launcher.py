@@ -282,10 +282,31 @@ def test_macos_drag_region_stays_on_safe_top_edge(
 
 
 @pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [
+        (1280, 800, (56, 768, 116, 32)),
+        (900, 600, (56, 568, 116, 32)),
+        (100, 8, (56, 0, 44, 8)),
+        (40, 8, (40, 0, 0, 8)),
+    ],
+)
+def test_macos_sidebar_drag_region_matches_empty_area_beside_traffic_lights(
+    width: float,
+    height: float,
+    expected: tuple[float, float, float, float],
+) -> None:
+    assert desktop_launcher._macos_sidebar_drag_region_frame(width, height) == expected
+
+
+@pytest.mark.parametrize(
     ("x", "y", "expected"),
     [
         (360, 768, True),
         (1019, 799, True),
+        (56, 768, True),
+        (171, 799, True),
+        (55, 795, False),
+        (172, 795, False),
         (359, 795, False),
         (500, 767, False),
         (1020, 795, False),
@@ -297,6 +318,64 @@ def test_macos_drag_region_excludes_traffic_lights_and_web_controls(
     expected: bool,
 ) -> None:
     assert desktop_launcher._point_is_in_macos_drag_region(x, y, 1280, 800) is expected
+
+
+def test_macos_file_open_panel_returns_selected_urls() -> None:
+    events: dict[str, object] = {}
+
+    class FakePanel:
+        def setCanChooseFiles_(self, value):
+            events["can_choose_files"] = value
+
+        def setCanChooseDirectories_(self, value):
+            events["can_choose_directories"] = value
+
+        def setAllowsMultipleSelection_(self, value):
+            events["allows_multiple_selection"] = value
+
+        def beginSheetModalForWindow_completionHandler_(self, window, handler):
+            events["panel_window"] = window
+            handler(1)
+
+        def URLs(self):
+            return ["file:///tmp/report.pdf", "file:///tmp/receipt.png"]
+
+    panel = FakePanel()
+
+    class FakeOpenPanel:
+        @staticmethod
+        def openPanel():
+            return panel
+
+    class FakeAppKit:
+        NSOpenPanel = FakeOpenPanel
+        NSModalResponseOK = 1
+
+    class FakeParameters:
+        def allowsDirectories(self):
+            return False
+
+        def allowsMultipleSelection(self):
+            return True
+
+    owner_window = object()
+    webview = type("WebView", (), {"window": lambda self: owner_window})()
+    completed: list[object] = []
+
+    desktop_launcher._present_macos_file_open_panel(
+        FakeAppKit,
+        webview,
+        FakeParameters(),
+        completed.append,
+    )
+
+    assert events == {
+        "can_choose_files": True,
+        "can_choose_directories": False,
+        "allows_multiple_selection": True,
+        "panel_window": owner_window,
+    }
+    assert completed == [["file:///tmp/report.pdf", "file:///tmp/receipt.png"]]
 
 
 def test_macos_window_embeds_local_ui() -> None:
@@ -367,6 +446,12 @@ def test_macos_window_embeds_local_ui() -> None:
         def setAutoresizingMask_(self, mask):
             events["autoresizing_mask"] = mask
 
+        def setNavigationDelegate_(self, delegate):
+            events["navigation_delegate"] = delegate
+
+        def setUIDelegate_(self, delegate):
+            events["ui_delegate"] = delegate
+
         def bounds(self):
             return type(
                 "Bounds",
@@ -418,12 +503,14 @@ def test_macos_window_embeds_local_ui() -> None:
 
     original_window_class = desktop_launcher._MACOS_WINDOW_CLASS
     desktop_launcher._MACOS_WINDOW_CLASS = None
+    delegate = object()
     try:
         window, webview = desktop_launcher._create_macos_webview_window(
             FakeAppKit,
             FakeFoundation,
             FakeWebKit,
             "http://127.0.0.1:5173/chat/",
+            delegate,
         )
     finally:
         desktop_launcher._MACOS_WINDOW_CLASS = original_window_class
@@ -432,6 +519,8 @@ def test_macos_window_embeds_local_ui() -> None:
     assert isinstance(webview, FakeWebView)
     assert webview is events["content_view"]
     assert events["request"] == "request:url:http://127.0.0.1:5173/chat/"
+    assert events["navigation_delegate"] is delegate
+    assert events["ui_delegate"] is delegate
     assert events["title"] == "StaffDeck"
     assert events["window_init"][1] & FakeAppKit.NSWindowStyleMaskFullSizeContentView
     assert events["title_visibility"] == FakeAppKit.NSWindowTitleHidden
@@ -441,7 +530,7 @@ def test_macos_window_embeds_local_ui() -> None:
     assert events["released_when_closed"] is False
     assert events["centered"] is True
 
-    point = type("Point", (), {"x": 500, "y": 795})()
+    point = type("Point", (), {"x": 100, "y": 795})()
     drag_event = type(
         "Event",
         (),
@@ -466,7 +555,7 @@ def test_macos_window_embeds_local_ui() -> None:
     window.sendEvent_(zoom_event)
     assert events["zoom_sender"] is window
 
-    web_control_point = type("Point", (), {"x": 100, "y": 795})()
+    web_control_point = type("Point", (), {"x": 220, "y": 795})()
     web_event = type(
         "Event",
         (),

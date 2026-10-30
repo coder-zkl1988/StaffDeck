@@ -540,10 +540,11 @@ def list_team_conversations(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> TeamConversationsResponse:
-    """团队会话列表:本租户登录用户可读(对齐 GET tasks);严格按 team_id 过滤,不串团队。"""
+    """团队会话列表:团队创建者/管理员可读(对齐 chat 会话的 owner/admin 规则)。"""
     ensure_tenant(db, tenant_id)
     _ensure_request_tenant(tenant_id, current_user)
     team = get_team(db, tenant_id, team_id)
+    _ensure_team_manager(team, current_user)
     leader = get_team_leader(db, team.id)
     tl: TeamConversationTLRead | None = None
     if leader is not None:
@@ -634,10 +635,11 @@ def list_team_conversation_messages(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> list[TeamConversationMessageRead]:
-    """团队会话消息:会话必须属于本团队(物理隔离),跨团队 sessionId 一律 404。"""
+    """团队会话消息:团队创建者/管理员可读;跨团队 sessionId 一律 404。"""
     ensure_tenant(db, tenant_id)
     _ensure_request_tenant(tenant_id, current_user)
     team = get_team(db, tenant_id, team_id)
+    _ensure_team_manager(team, current_user)
     session = db.get(ChatSession, session_id)
     if session is None or session.tenant_id != tenant_id or session.team_id != team.id:
         raise HTTPException(status_code=404, detail="Team conversation not found")
@@ -680,6 +682,7 @@ def get_team_conversation_stream(
     ensure_tenant(db, tenant_id)
     _ensure_request_tenant(tenant_id, current_user)
     team = get_team(db, tenant_id, team_id)
+    _ensure_team_manager(team, current_user)
     session = db.get(ChatSession, session_id)
     if session is None or session.tenant_id != tenant_id or session.team_id != team.id:
         raise HTTPException(status_code=404, detail="Team conversation not found")
@@ -1379,10 +1382,15 @@ def list_team_threads(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> list[TeamThreadRead]:
-    """TL 对话会话 + 任务执行会话,按 updated_at 倒序取 50 条。"""
+    """TL 对话会话 + 任务执行会话,按 updated_at 倒序取 50 条。
+
+    非管理员只看到自己创建的团队线程(对齐 chat 会话的 owner/admin 规则)。
+    """
     ensure_tenant(db, tenant_id)
     _ensure_request_tenant(tenant_id, current_user)
     teams = list(db.exec(select(Team).where(Team.tenant_id == tenant_id)).all())
+    if not _is_admin_user(current_user):
+        teams = [team for team in teams if team.owner_user_id == current_user.id]
     threads: list[TeamThreadRead] = []
     for team in teams:
         leader = get_team_leader(db, team.id)

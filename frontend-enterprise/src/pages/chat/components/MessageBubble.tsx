@@ -2,6 +2,7 @@ import EmployeeAvatar from '@/components/EmployeeAvatar';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
 import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
 import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
+import { memo } from 'react';
 import { employeeDisplayName } from '@/employee';
 import { cn } from '@/lib/utils';
 import type {
@@ -91,7 +92,7 @@ function activeTeamProgress(item: ChatMessage): { phase: string; statusText: str
   return statusText ? { phase, statusText } : null;
 }
 
-export default function MessageBubble({ chat, item, render }: MessageBubbleProps) {
+function MessageBubbleBase({ chat, item, render }: MessageBubbleProps) {
   const {
     toggleTrace,
     rateMessage,
@@ -299,3 +300,43 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
     </div>
   );
 }
+
+// 流式期间父层每个 tick 都会重渲染:按内容与稳定引用做浅比较,
+// 历史消息不再随 100ms tick / 1.5s 轮询整树重算(含 markdown 重解析)。
+const MessageBubble = memo(
+  MessageBubbleBase,
+  (prev, next) => {
+    const chatSame =
+      prev.chat === next.chat ||
+      (prev.chat.tenantId === next.chat.tenantId &&
+        prev.chat.activeConversationId === next.chat.activeConversationId &&
+        prev.chat.displayedAgent === next.chat.displayedAgent &&
+        prev.chat.displayedTeam === next.chat.displayedTeam &&
+        prev.chat.slashCommands === next.chat.slashCommands &&
+        prev.chat.toggleTrace === next.chat.toggleTrace &&
+        prev.chat.rateMessage === next.chat.rateMessage &&
+        prev.chat.setActiveCitation === next.chat.setActiveCitation &&
+        prev.chat.confirmScheduledTask === next.chat.confirmScheduledTask &&
+        prev.chat.dismissScheduledTaskDraft === next.chat.dismissScheduledTaskDraft &&
+        prev.chat.removeQueuedTurn === next.chat.removeQueuedTurn);
+    return (
+      chatSame &&
+      prev.item === next.item &&
+      prev.render.visibleContent === next.render.visibleContent &&
+      prev.render.traceTurnId === next.render.traceTurnId &&
+      prev.render.summary === next.render.summary &&
+      prev.render.details === next.render.details &&
+      prev.render.expanded === next.render.expanded &&
+      prev.render.showInlineTrace === next.render.showInlineTrace &&
+      prev.render.citations === next.render.citations &&
+      prev.render.scheduledDraft === next.render.scheduledDraft &&
+      prev.render.createdTask === next.render.createdTask &&
+      prev.render.scheduledTaskPrompt === next.render.scheduledTaskPrompt &&
+      prev.render.attachments === next.render.attachments &&
+      prev.render.harnessArtifacts === next.render.harnessArtifacts &&
+      prev.render.statusOnly === next.render.statusOnly
+    );
+  },
+);
+
+export default MessageBubble;

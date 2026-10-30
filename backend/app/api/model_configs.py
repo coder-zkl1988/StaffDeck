@@ -63,7 +63,11 @@ def list_model_protocols(tenant_id: str = Query(...)) -> dict[str, list[str]]:
 
 
 def model_config_read(row: ModelConfig) -> ModelConfigRead:
-    api_key = decrypt_secret(row.api_key_encrypted)
+    # APP_SECRET 轮换后旧密文无法解密:优雅降级而不是让列表端点 500
+    try:
+        api_key = decrypt_secret(row.api_key_encrypted)
+    except ValueError:
+        api_key = ""
     extra_body = row.extra_body_json if isinstance(row.extra_body_json, dict) else {}
     return ModelConfigRead(
         id=row.id,
@@ -72,7 +76,9 @@ def model_config_read(row: ModelConfig) -> ModelConfigRead:
         provider=row.provider,
         api_protocol=row.api_protocol,
         base_url=row.base_url,
-        api_key_masked=mask_secret(api_key),
+        api_key_masked=(
+            "无法解密(需重新保存密钥)" if row.api_key_encrypted and not api_key else mask_secret(api_key)
+        ),
         model=row.model,
         temperature=row.temperature,
         max_output_tokens=row.max_output_tokens,

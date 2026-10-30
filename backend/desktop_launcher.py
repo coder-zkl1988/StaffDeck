@@ -30,6 +30,8 @@ _MACOS_WINDOW_CLASS = None
 MACOS_DRAG_REGION_LEFT_INSET = 360
 MACOS_DRAG_REGION_RIGHT_INSET = 260
 MACOS_DRAG_REGION_HEIGHT = 32
+MACOS_SIDEBAR_DRAG_REGION_LEFT_INSET = 56
+MACOS_SIDEBAR_DRAG_REGION_WIDTH = 116
 STAFFDECK_ICON_PNG = ("packaging", "assets", "staffdeck.png")
 LARK_PACKAGING_SMOKE_IMPORTS = (
     ("lark_channel", "EventDispatcherHandler"),
@@ -421,11 +423,30 @@ def _macos_drag_region_frame(width: float, height: float) -> tuple[float, float,
     )
 
 
-def _point_is_in_macos_drag_region(x: float, y: float, width: float, height: float) -> bool:
-    origin_x, origin_y, region_width, region_height = _macos_drag_region_frame(width, height)
+def _macos_sidebar_drag_region_frame(
+    width: float,
+    height: float,
+) -> tuple[float, float, float, float]:
+    """Expose the empty strip beside the traffic lights as a second drag handle."""
+    origin_x = min(width, MACOS_SIDEBAR_DRAG_REGION_LEFT_INSET)
+    right_edge = min(width, origin_x + MACOS_SIDEBAR_DRAG_REGION_WIDTH)
     return (
+        origin_x,
+        max(0, height - MACOS_DRAG_REGION_HEIGHT),
+        max(0, right_edge - origin_x),
+        min(height, MACOS_DRAG_REGION_HEIGHT),
+    )
+
+
+def _point_is_in_macos_drag_region(x: float, y: float, width: float, height: float) -> bool:
+    frames = (
+        _macos_sidebar_drag_region_frame(width, height),
+        _macos_drag_region_frame(width, height),
+    )
+    return any(
         origin_x <= x < origin_x + region_width
         and origin_y <= y < origin_y + region_height
+        for origin_x, origin_y, region_width, region_height in frames
     )
 
 
@@ -440,7 +461,31 @@ def preload_server_app(cfg: dict) -> None:
     cfg["app"] = getattr(module, attribute_name)
 
 
-def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
+def _present_macos_file_open_panel(AppKit, webview, parameters, completion_handler) -> None:
+    """Bridge WKWebView file inputs to the native macOS open panel."""
+    panel = AppKit.NSOpenPanel.openPanel()
+    allows_directories = bool(parameters.allowsDirectories())
+    panel.setCanChooseFiles_(not allows_directories)
+    panel.setCanChooseDirectories_(allows_directories)
+    panel.setAllowsMultipleSelection_(bool(parameters.allowsMultipleSelection()))
+
+    def finish(response) -> None:
+        completion_handler(panel.URLs() if response == AppKit.NSModalResponseOK else None)
+
+    owner_window = webview.window()
+    if owner_window is not None:
+        panel.beginSheetModalForWindow_completionHandler_(owner_window, finish)
+    else:
+        finish(panel.runModal())
+
+
+def _create_macos_webview_window(
+    AppKit,
+    Foundation,
+    WebKit,
+    target: str,
+    webview_delegate=None,
+):
     """Create the native macOS window used by both arm64 and x86_64 bundles."""
     try:
         import objc
@@ -504,6 +549,9 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
 
     webview = WebKit.WKWebView.alloc().initWithFrame_(window.contentView().bounds())
     webview.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    if webview_delegate is not None:
+        webview.setNavigationDelegate_(webview_delegate)
+        webview.setUIDelegate_(webview_delegate)
     page_url = Foundation.NSURL.URLWithString_(target)
     if page_url is None:
         raise RuntimeError(f"Invalid StaffDeck window URL: {target!r}")
@@ -604,7 +652,8 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
             image.setSize_((point_size, point_size))
         return image
 
-    class WebViewNavigationDelegate(AppKit.NSObject):
+    # Formal WebKit protocols erase block signatures in PyObjC 12.2.2 and crash navigation.
+    class WebViewDelegate(AppKit.NSObject):
         def webView_decidePolicyForNavigationAction_decisionHandler_(  # noqa: N802
             self,
             _webview,
@@ -618,6 +667,20 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
                 decision_handler(WebKit.WKNavigationActionPolicyCancel)
                 return
             decision_handler(WebKit.WKNavigationActionPolicyAllow)
+
+        def webView_runOpenPanelWithParameters_initiatedByFrame_completionHandler_(  # noqa: N802
+            self,
+            webview,
+            parameters,
+            _frame,
+            completion_handler,
+        ):
+            _present_macos_file_open_panel(
+                AppKit,
+                webview,
+                parameters,
+                completion_handler,
+            )
 
     class AppDelegate(AppKit.NSObject):
         def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
@@ -656,14 +719,14 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
 
         def showMainWindow_(self, target):
             if self.main_window is None:
+                self.webview_delegate = WebViewDelegate.alloc().init()
                 self.main_window, self.main_webview = _create_macos_webview_window(
                     AppKit,
                     Foundation,
                     WebKit,
                     str(target),
+                    self.webview_delegate,
                 )
-                self.webview_navigation_delegate = WebViewNavigationDelegate.alloc().init()
-                self.main_webview.setNavigationDelegate_(self.webview_navigation_delegate)
             else:
                 self.main_window.makeKeyAndOrderFront_(None)
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)

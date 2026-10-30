@@ -167,12 +167,30 @@ def _migrate_sqlite_skill_schema() -> None:
                 if column_name not in webhook_columns:
                     conn.execute(text(ddl))
 
+        if "scheduled_task_runs" in tables:
+            run_columns = {
+                column["name"] for column in inspector.get_columns("scheduled_task_runs")
+            }
+            if "retry_count" not in run_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE scheduled_task_runs "
+                        "ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+
         if "users" in tables:
             user_columns = {column["name"] for column in inspector.get_columns("users")}
             if "role" not in user_columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR NOT NULL DEFAULT 'member'"))
             if "source" not in user_columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN source VARCHAR NOT NULL DEFAULT 'web'"))
+            if "token_version" not in user_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
             if "display_name" in user_columns:
                 conn.execute(
                     text(

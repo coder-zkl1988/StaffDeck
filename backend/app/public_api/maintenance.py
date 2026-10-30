@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 
+from app.observability.retention import cleanup_observability_records
 from app.public_api.jobs import cleanup_public_api_records
 from app.public_api.webhooks import enqueue_due_webhook_deliveries
 
@@ -17,6 +18,8 @@ def _loop() -> None:
         cleanup_tick += 1
         if cleanup_tick >= 120:
             cleanup_public_api_records()
+            with _session() as db:
+                cleanup_observability_records(db)
             cleanup_tick = 0
 
 
@@ -35,3 +38,11 @@ def stop_public_api_maintenance() -> None:
     if _thread:
         _thread.join(timeout=2)
     _thread = None
+
+
+def _session():
+    from sqlmodel import Session
+
+    from app.db import engine
+
+    return Session(engine)

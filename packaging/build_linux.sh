@@ -4,7 +4,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.5.1}"
+export VERSION
 DEB_VERSION="${VERSION#v}"
 ARCH="$(uname -m)"
 RUNTIME_DL_DIR="${RUNTIME_DL_DIR:-packaging/runtime_dl}"

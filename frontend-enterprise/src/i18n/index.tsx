@@ -86,12 +86,20 @@ function interpolate(target: string, values: Record<string | number, string | nu
   return target.replace(TEMPLATE_TOKEN, (_, key: string) => String(values[key] ?? `{${key}}`));
 }
 
+// 最长词条 108 字符、最长模板 43 字符:超过该长度的文本(如流式 markdown 正文)
+// 不可能命中任何词条,直接跳过,避免每个流式 tick 对上千条模板跑正则
+const MAX_TRANSLATABLE_CHARS = 160;
+
 function translateCore(source: string): string | null {
   if (translationCache.has(source)) return translationCache.get(source) || null;
   const exact = exactCatalog.get(source);
   if (exact) {
     translationCache.set(source, exact);
     return exact;
+  }
+  if (source.length > MAX_TRANSLATABLE_CHARS) {
+    translationCache.set(source, null);
+    return null;
   }
   for (const template of compiledTemplates) {
     const match = source.match(template.pattern);
@@ -248,6 +256,12 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     document.documentElement.lang = locale;
     const root = document.documentElement;
     localizeSubtree(root, locale);
+
+    if (locale !== 'en-US') {
+      // 中文是源语言:一次性处理(还原/记录原文)即可,不挂 MutationObserver,
+      // 默认语言下不再为每次 DOM 变化付扫描成本;切换回 en-US 时会重新挂载并全量处理
+      return;
+    }
 
     let scheduled = false;
     let disposed = false;

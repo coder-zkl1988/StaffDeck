@@ -275,6 +275,13 @@ def test_resource_binding_requires_agent_manager() -> None:
         )
         db.add(agent)
         db.add(tool)
+        db.flush()
+        # 真实 create_tool 流程会建立整体 agent 的画廊绑定
+        db.add(
+            AgentProfile(id="agent_overall", tenant_id="tenant_demo", name="整体", is_overall=True)
+        )
+        db.flush()
+        ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id)
         db.commit()
         request = AgentResourcesUpdateRequest(
             tenant_id="tenant_demo",
@@ -287,6 +294,59 @@ def test_resource_binding_requires_agent_manager() -> None:
 
         bindings = update_agent_resources(agent.id, request, db=db, current_user=owner)
         assert [(item.resource_type, item.resource_id) for item in bindings] == [("tool", tool.id)]
+
+
+def test_resource_binding_cannot_steal_private_resource_of_other_agent() -> None:
+    """agent A 的所有者不能绑定 agent B 的私有资源(防 IDOR 读取私有数据)。"""
+    with _test_session() as db:
+        owner, other, admin = _seed_users(db)
+        agent_a = AgentProfile(
+            id="agent_a",
+            tenant_id="tenant_demo",
+            name="员工A",
+            is_overall=False,
+            metadata_json={"owner_user_id": owner.id, "owner_username": owner.username},
+        )
+        agent_b = AgentProfile(
+            id="agent_b",
+            tenant_id="tenant_demo",
+            name="员工B",
+            is_overall=False,
+            metadata_json={"owner_user_id": other.id, "owner_username": other.username},
+        )
+        private_tool = Tool(
+            id="tool_private_b",
+            tenant_id="tenant_demo",
+            name="private_lookup",
+            display_name="B 的私有工具",
+            method="POST",
+            url="/private",
+        )
+        db.add(agent_a)
+        db.add(agent_b)
+        db.add(private_tool)
+        db.flush()
+        # 私有绑定在员工 B 上:对员工 A 不可见
+        ensure_private_resource_binding(
+            db, "tenant_demo", agent_b.id, "tool", private_tool.id
+        )
+        db.commit()
+        request = AgentResourcesUpdateRequest(
+            tenant_id="tenant_demo",
+            resources=[
+                AgentResourceBindingInput(resource_type="tool", resource_id=private_tool.id)
+            ],
+        )
+
+        with pytest.raises(HTTPException) as update_error:
+            update_agent_resources(agent_a.id, request, db=db, current_user=owner)
+        assert update_error.value.status_code == 403
+
+        # 管理员仍可 curated 绑定
+        bindings = update_agent_resources(agent_a.id, request, db=db, current_user=admin)
+        assert [(item.resource_type, item.resource_id) for item in bindings] == [
+            ("tool", private_tool.id)
+        ]
 
 
 def test_list_agents_filters_to_visible_agents_for_non_admin() -> None:

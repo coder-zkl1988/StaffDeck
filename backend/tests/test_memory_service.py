@@ -211,6 +211,42 @@ def test_memory_recall_excludes_summary_history() -> None:
     assert rows[0].content == "用户偏好客服回复简洁。"
 
 
+def test_memory_recall_ranks_by_query_relevance() -> None:
+    with _test_session() as db:
+        db.add(
+            MemoryRecord(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                username="user_demo",
+                session_id="s1",
+                kind="fact",
+                content="门店营业时间为早上十点。",
+                importance=0.5,
+            )
+        )
+        db.add(
+            MemoryRecord(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                username="user_demo",
+                session_id="s2",
+                kind="preference",
+                content="退款偏好原路退回银行卡。",
+                importance=0.5,
+                metadata_json={"key": "refund_preference"},
+            )
+        )
+        db.commit()
+
+        service = MemoryService(db)
+        matched = service.recall("tenant_demo", "user_demo", "退款 原路")
+        assert [row.content for row in matched] == ["退款偏好原路退回银行卡。"]
+
+        # 完全不命中时回退时间序,而不是返回空
+        fallback = service.recall("tenant_demo", "user_demo", "天气如何")
+        assert len(fallback) == 2
+
+
 def test_context_memories_returns_all_supported_memories_without_model_selection() -> None:
     with _test_session() as db:
         for index, kind in enumerate(["profile", "preference", "fact"]):

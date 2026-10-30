@@ -1,5 +1,5 @@
 import type { FormEvent } from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
@@ -20,11 +20,15 @@ import {
   CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
   CHAT_COMPOSER_ATTACHMENT_COPY_CLASS,
   CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_FADE_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_FADE_LEFT_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_FADE_RIGHT_CLASS,
   CHAT_COMPOSER_ATTACHMENT_IMG_CLASS,
   CHAT_COMPOSER_ATTACHMENT_NAME_CLASS,
   CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS,
   CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS,
   CHAT_COMPOSER_ATTACHMENTS_CLASS,
+  CHAT_COMPOSER_ATTACHMENTS_SHELL_CLASS,
   CHAT_COMPOSER_AVATAR_CLASS,
   CHAT_COMPOSER_CONTEXT_ROW_CLASS,
   CHAT_COMPOSER_DROP_HINT_CLASS,
@@ -107,10 +111,12 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+  const attachmentStripRef = useRef<HTMLDivElement>(null);
   const [scheduleIntentHovered, setScheduleIntentHovered] = useState(false);
   const [slashSelectionIndex, setSlashSelectionIndex] = useState(0);
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
   const [activeSlashCommand, setActiveSlashCommand] = useState<ChatSlashCommand | null>(null);
+  const [attachmentOverflow, setAttachmentOverflow] = useState({ left: false, right: false });
   const slashMatches = useMemo(
     () => matchingSlashCommands(input, slashCommands),
     [input, slashCommands],
@@ -119,6 +125,16 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     !slashMenuDismissed && slashCommandQuery(input) && slashMatches.length,
   );
   const composerText = slashCommandComposerText(input, activeSlashCommand);
+
+  const updateAttachmentOverflow = useCallback(() => {
+    const element = attachmentStripRef.current;
+    if (!element) return;
+    const left = element.scrollLeft > 1;
+    const right = element.scrollLeft + element.clientWidth < element.scrollWidth - 1;
+    setAttachmentOverflow((current) =>
+      current.left === left && current.right === right ? current : { left, right },
+    );
+  }, []);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -159,6 +175,22 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
       selected.offsetHeight,
     );
   }, [slashMatches.length, slashMenuOpen, slashSelectionIndex]);
+
+  useEffect(() => {
+    const element = attachmentStripRef.current;
+    if (!element) {
+      setAttachmentOverflow({ left: false, right: false });
+      return;
+    }
+    updateAttachmentOverflow();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateAttachmentOverflow);
+    observer?.observe(element);
+    window.addEventListener('resize', updateAttachmentOverflow);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateAttachmentOverflow);
+    };
+  }, [composerAttachments, updateAttachmentOverflow]);
 
   const selectSlashCommand = (index: number) => {
     const command = slashMatches[index];
@@ -304,38 +336,61 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
           {composerDragActive && <div className={CHAT_COMPOSER_DROP_HINT_CLASS}>松开上传文件</div>}
 
           {composerAttachments.length > 0 && (
-            <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS}>
-              {composerAttachments.map((attachment) => (
-                <div
-                  className={cn(
-                    CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
-                    attachment.uploadStatus === 'error' && CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS,
-                  )}
-                  key={attachment.uploadKey}
-                >
-                  {attachment.kind === 'image' && attachment.data_url ? (
-                    <img className={CHAT_COMPOSER_ATTACHMENT_IMG_CLASS} src={attachment.data_url} alt={attachment.filename} />
-                  ) : (
-                    <StaffdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={16} />
-                  )}
-                  <span className={CHAT_COMPOSER_ATTACHMENT_COPY_CLASS}>
-                    <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
-                    <span className={CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS}>
-                      {attachment.uploadStatus === 'uploading' && '解析中'}
-                      {attachment.uploadStatus === 'ready' && attachmentTypeLabel(attachment)}
-                      {attachment.uploadStatus === 'error' && (attachment.error || '上传失败')}
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    className={CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS}
-                    onClick={() => removeComposerAttachment(attachment.uploadKey)}
-                    aria-label="移除附件"
+            <div className={CHAT_COMPOSER_ATTACHMENTS_SHELL_CLASS}>
+              <div
+                ref={attachmentStripRef}
+                className={CHAT_COMPOSER_ATTACHMENTS_CLASS}
+                role="list"
+                aria-label="待发送附件"
+                onScroll={updateAttachmentOverflow}
+              >
+                {composerAttachments.map((attachment) => (
+                  <div
+                    className={cn(
+                      CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
+                      attachment.uploadStatus === 'error' && CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS,
+                    )}
+                    key={attachment.uploadKey}
+                    role="listitem"
                   >
-                    ×
-                  </button>
-                </div>
-              ))}
+                    {attachment.kind === 'image' && attachment.data_url ? (
+                      <img className={CHAT_COMPOSER_ATTACHMENT_IMG_CLASS} src={attachment.data_url} alt={attachment.filename} />
+                    ) : (
+                      <StaffdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={16} />
+                    )}
+                    <span className={CHAT_COMPOSER_ATTACHMENT_COPY_CLASS}>
+                      <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
+                      <span className={CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS}>
+                        {attachment.uploadStatus === 'uploading' && '解析中'}
+                        {attachment.uploadStatus === 'ready' && attachmentTypeLabel(attachment)}
+                        {attachment.uploadStatus === 'error' && (attachment.error || '上传失败')}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className={CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS}
+                      onClick={() => removeComposerAttachment(attachment.uploadKey)}
+                      aria-label="移除附件"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {attachmentOverflow.left && (
+                <span
+                  aria-hidden="true"
+                  data-attachment-overflow="left"
+                  className={cn(CHAT_COMPOSER_ATTACHMENT_FADE_CLASS, CHAT_COMPOSER_ATTACHMENT_FADE_LEFT_CLASS)}
+                />
+              )}
+              {attachmentOverflow.right && (
+                <span
+                  aria-hidden="true"
+                  data-attachment-overflow="right"
+                  className={cn(CHAT_COMPOSER_ATTACHMENT_FADE_CLASS, CHAT_COMPOSER_ATTACHMENT_FADE_RIGHT_CLASS)}
+                />
+              )}
             </div>
           )}
 

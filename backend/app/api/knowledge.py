@@ -1160,18 +1160,23 @@ def _ensure_open_gallery_knowledge_admin(
     current_user: object | None,
 ) -> None:
     knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
+    if not knowledge_base or knowledge_base.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
     metadata = (
         knowledge_base.metadata_json
-        if knowledge_base and isinstance(knowledge_base.metadata_json, dict)
+        if isinstance(knowledge_base.metadata_json, dict)
         else {}
     )
     owner_agent_id = metadata.get("owner_agent_id")
     if isinstance(owner_agent_id, str) and owner_agent_id:
         ensure_agent_scope_manager(db, tenant_id, owner_agent_id, current_user)
         return
-    if (
-        knowledge_base
-        and knowledge_base.tenant_id == tenant_id
-        and is_open_gallery_resource(db, tenant_id, "knowledge_base", knowledge_base)
-    ):
+    if is_open_gallery_resource(db, tenant_id, "knowledge_base", knowledge_base):
         ensure_open_gallery_admin(tenant_id, current_user)
+        return
+    # 被管理员隐藏/解绑的画廊资源与未知归属一律拒绝(fail-closed),
+    # 防止跨租户或越权写入。
+    raise HTTPException(
+        status_code=403,
+        detail="Knowledge base is not manageable in this scope",
+    )

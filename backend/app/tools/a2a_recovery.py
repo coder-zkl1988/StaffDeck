@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlmodel import Session, select
 
@@ -11,6 +11,11 @@ from app.tools.tool_schema import ToolCall
 
 
 _RECOVERABLE_STATES = {"submitted", "working"}
+# 恢复记录数量不可控:有界执行器避免重启后一次开 N 个各持 DB 会话的线程
+_RECOVERY_WORKERS = 4
+_recovery_executor = ThreadPoolExecutor(
+    max_workers=_RECOVERY_WORKERS, thread_name_prefix="a2a-client-recovery"
+)
 
 
 def recover_a2a_client_tasks() -> None:
@@ -26,12 +31,7 @@ def recover_a2a_client_tasks() -> None:
             ).all()
         )
     for run_id in run_ids:
-        threading.Thread(
-            target=_recover_one,
-            args=(str(run_id),),
-            name=f"a2a-client-recovery-{run_id}",
-            daemon=True,
-        ).start()
+        _recovery_executor.submit(_recover_one, str(run_id))
 
 
 def _recover_one(run_id: str) -> None:

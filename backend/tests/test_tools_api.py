@@ -12,6 +12,7 @@ from app.agents.branching import ensure_open_gallery_binding, ensure_private_res
 from app.api.tools import (
     _ensure_tool_visible,
     _normalize_probe_url,
+    _probe_timeout_seconds,
     _read_execution_policy,
     _tool_config,
     cancel_a2a_task_run,
@@ -430,6 +431,8 @@ def test_probe_tool_success_infers_output_schema(monkeypatch: pytest.MonkeyPatch
         lambda: SimpleNamespace(
             normalized_tool_base_url="http://localhost:5173",
             tool_timeout_seconds=30.0,
+            tool_probe_allow_private_networks=False,
+            tool_probe_max_timeout_seconds=30.0,
         ),
     )
 
@@ -680,7 +683,7 @@ def test_probe_stdio_mcp_tool_success_infers_output_schema() -> None:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.commit()
 
-        result = probe_tool(
+        result = _probe_tool(
             ToolProbeRequest(
                 tenant_id="tenant_demo",
                 name="mcp.real_product_lookup",
@@ -696,6 +699,7 @@ def test_probe_stdio_mcp_tool_success_infers_output_schema() -> None:
                 sample_arguments={"product_id": "A1"},
             ),
             db,
+            _admin_user(),
         )
 
         assert result.success is True
@@ -703,6 +707,88 @@ def test_probe_stdio_mcp_tool_success_infers_output_schema() -> None:
         assert result.data_preview["found"] is True
         assert result.data_preview["price"] == 129.0
         assert result.inferred_output_schema["properties"]["price"]["type"] == "number"
+
+
+def test_probe_stdio_mcp_rejected_for_member() -> None:
+    """成员身份不得通过 probe 拉起任意本地命令(stdio 要求管理员)。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            probe_tool(
+                ToolProbeRequest(
+                    tenant_id="tenant_demo",
+                    name="mcp.shell",
+                    tool_type="mcp",
+                    method="POST",
+                    url="mcp://stdio/mock",
+                    mcp_config={
+                        "transport": "stdio",
+                        "command": sys.executable,
+                        "args": [str(_mock_mcp_server_path())],
+                    },
+                ),
+                db,
+            )
+
+        assert exc_info.value.status_code == 403
+
+
+def test_probe_stdio_mcp_command_allowlist_blocks_arbitrary_binaries() -> None:
+    """管理员 probe 也只允许白名单内的 stdio 命令。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        result = _probe_tool(
+            ToolProbeRequest(
+                tenant_id="tenant_demo",
+                name="mcp.shell",
+                tool_type="mcp",
+                method="POST",
+                url="mcp://stdio/shell",
+                mcp_config={"transport": "stdio", "command": "/bin/sh", "args": ["-c", "id"]},
+            ),
+            db,
+            _admin_user(),
+        )
+
+        assert result.success is False
+        assert result.error is not None
+        assert result.error.code == "STDIO_COMMAND_BLOCKED"
+
+
+def test_probe_http_blocks_private_metadata_target() -> None:
+    """探测不得指向内网/云元数据地址(SSRF 防护)。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        result = probe_tool(
+            ToolProbeRequest(
+                tenant_id="tenant_demo",
+                name="metadata",
+                method="GET",
+                url="http://169.254.169.254/latest/meta-data/",
+            ),
+            db,
+        )
+
+        assert result.success is False
+        assert result.error is not None
+        assert result.error.code == "PROBE_TARGET_BLOCKED"
+
+
+def test_probe_timeout_clamped_to_max() -> None:
+    request = ToolProbeRequest(
+        tenant_id="tenant_demo",
+        name="slow",
+        method="GET",
+        url="https://example.com/",
+        execution_policy=ToolExecutionPolicy(timeout_seconds=3600.0),
+    )
+    assert _probe_timeout_seconds(request) == get_settings().tool_probe_max_timeout_seconds
 
 
 def test_probe_tool_relative_url_uses_configured_tool_base(monkeypatch: pytest.MonkeyPatch) -> None:

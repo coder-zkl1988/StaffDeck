@@ -81,12 +81,35 @@ def test_discover_stdio_mcp_server_lists_tools() -> None:
                 ),
             ),
             db,
-            _member_user(),
+            _admin_user(),
         )
 
         assert response.success is True
         names = {tool.name for tool in response.tools}
         assert {"echo", "sum", "product_lookup"} <= names
+
+
+def test_discover_stdio_mcp_rejected_for_member() -> None:
+    """成员不得通过 adhoc 发现拉起任意本地命令(stdio 要求管理员)。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            discover_mcp_tools_adhoc(
+                MCPDiscoverRequest(
+                    tenant_id="tenant_demo",
+                    connection=MCPServerConnection(
+                        transport="stdio",
+                        command=sys.executable,
+                        args=[str(_mock_mcp_server_path())],
+                    ),
+                ),
+                db,
+                _member_user(),
+            )
+
+        assert exc_info.value.status_code == 403
 
 
 def test_mcp_apps_negotiation_preserves_metadata_and_resource() -> None:

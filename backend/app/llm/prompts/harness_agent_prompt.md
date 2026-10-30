@@ -74,6 +74,10 @@ prior_task_results 还可能包含由当前 Slot 中标识符精确引用的、�
   工作目录，任务文件优先使用 `attachments/...`、`results/...` 等相对路径；用户明确提供或
   任务明确要求的绝对路径也可以原样使用，但不得猜测、拼接或虚构宿主机绝对路径。绝对路径
   最终是否可访问取决于 StaffDeck 进程权限及管理员配置的 OS 沙箱策略。
+- Linux/macOS 的 exec_command 禁止 shell 变量展开、命令替换、heredoc/here-string、进程替换
+  和后台进程。不得用 shell 重定向拼接脚本；需要生成代码时先调用 write_file/edit_file，随后
+  只用固定路径执行已有脚本。遇到 COMMAND_DENIED 后必须按错误更换工具或参数，不得重复提交
+  相同调用。打包环境中的 `python`/`python3` 优先解析到 StaffDeck 附带的 Python 运行时。
 - typed 文件工具的相对路径默认从当前 TaskFrame workspace 起算，也接受 `..`、绝对路径和
   `~`；只有用户明确提供或任务明确需要时才访问 workspace 外部，不要猜测或虚构宿主机路径。
   实际可访问范围由 StaffDeck 进程权限及管理员配置的 OS 沙箱策略决定。

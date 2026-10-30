@@ -16,7 +16,9 @@ from app.db.models import Team, TeamTask, TeamWakeEvent, utc_now
 from app.teams.service import apply_task_transition
 from app.teams.module_scope import team_module_enabled
 from app.teams.wakeup import (
+    WAKE_LEASE_TIMEOUT_SECONDS,
     _drain_member_queue,
+    _wake_task_id,
     dispatch_pending_wake_events,
     maybe_enqueue_team_synthesis,
     recover_orphaned_wake_events,
@@ -41,10 +43,29 @@ def task_timeout_minutes(team: Team) -> float:
     return value if value > 0 else DEFAULT_TASK_TIMEOUT_MINUTES
 
 
+def _task_has_live_execution(db: Session, task: TeamTask, *, now: datetime) -> bool:
+    """任务是否存在仍在心跳租约内的执行线程(claimed 且近期续约)。
+
+    唤醒线程执行期间每 WAKE_HEARTBEAT_SECONDS 续约一次;租约未过期说明
+    成员/评审仍在真实执行(长任务不受 updated_at 停滞误导),不应被超时升级。
+    """
+    cutoff = now - timedelta(seconds=WAKE_LEASE_TIMEOUT_SECONDS)
+    events = db.exec(
+        select(TeamWakeEvent).where(
+            TeamWakeEvent.team_id == task.team_id,
+            TeamWakeEvent.status == "claimed",
+        )
+    ).all()
+    return any(
+        _wake_task_id(event) == task.id and event.updated_at >= cutoff for event in events
+    )
+
+
 def sweep_timed_out_tasks(db: Session, *, now: datetime | None = None) -> list[TeamTask]:
     """扫一轮超时任务:置 escalated 记审计,关联 pending 唤醒标记 failed(error=timeout)。
 
     in_progress 任务超时后释放成员执行额度,尝试出队该成员的排队唤醒。
+    存在活跃心跳租约的任务本轮跳过(仍在真实执行,见 _task_has_live_execution)。
     返回本次被升级的任务列表。
     """
     if not team_module_enabled(db):
@@ -60,6 +81,8 @@ def sweep_timed_out_tasks(db: Session, *, now: datetime | None = None) -> list[T
             continue
         timeout_minutes = task_timeout_minutes(team)
         if now - task.updated_at < timedelta(minutes=timeout_minutes):
+            continue
+        if _task_has_live_execution(db, task, now=now):
             continue
         previous = task.status
         apply_task_transition(

@@ -630,7 +630,8 @@ def update_agent_resources(
     by_key = {(row.resource_type, row.resource_id): row for row in existing}
     desired_keys: set[tuple[str, str]] = set()
     for item in request.resources:
-        _ensure_resource_exists(db, request.tenant_id, item)
+        resource = _ensure_resource_exists(db, request.tenant_id, item)
+        _ensure_resource_bindable(db, request.tenant_id, agent, item, resource, current_user)
         key = (item.resource_type, item.resource_id)
         desired_keys.add(key)
         row = by_key.get(key)
@@ -2078,7 +2079,9 @@ def _is_empty_default_knowledge_base(db: Session, tenant_id: str, kb: KnowledgeB
     return kb.name == "默认知识库"
 
 
-def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBindingInput) -> None:
+def _ensure_resource_exists(
+    db: Session, tenant_id: str, item: AgentResourceBindingInput
+) -> object:
     model = {
         "skill": Skill,
         "general_skill": GeneralSkill,
@@ -2090,6 +2093,41 @@ def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBind
         raise HTTPException(
             status_code=404, detail=f"Resource not found: {item.resource_type}:{item.resource_id}"
         )
+    return row
+
+
+def _ensure_resource_bindable(
+    db: Session,
+    tenant_id: str,
+    agent: AgentProfile,
+    item: AgentResourceBindingInput,
+    resource: object,
+    current_user: User,
+) -> None:
+    """非管理员只能绑定该员工可见的资源(开放画廊资源或本员工已有私有绑定)。
+
+    防止 agent A 的管理者把 agent B 的私有知识库/技能绑过来读取其私有数据。
+    """
+    if _is_admin_user(current_user):
+        return
+    if is_open_gallery_resource(db, tenant_id, item.resource_type, resource):
+        return
+    own_binding = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == agent.id,
+            AgentResourceBinding.resource_type == item.resource_type,
+            AgentResourceBinding.resource_id == item.resource_id,
+        )
+    ).first()
+    if own_binding is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"Resource is not visible to this staff: {item.resource_type}:{item.resource_id}"
+        ),
+    )
 
 
 def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:

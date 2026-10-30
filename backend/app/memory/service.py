@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import datetime
 from typing import Any
 
 from sqlmodel import Session, select
@@ -18,6 +19,9 @@ PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "memory_extract
 MEMORY_SOURCE = "model_memory_extractor"
 PROFILE_NAME_KEY = "preferred_name"
 ALLOWED_MEMORY_KINDS = {"profile", "preference", "fact"}
+# recall 的候选池与默认返回量:候选池按 updated_at 取最近的记录
+RECALL_CANDIDATE_POOL = 200
+DEFAULT_RECALL_LIMIT = 20
 
 
 class MemoryService:
@@ -32,8 +36,34 @@ class MemoryService:
         limit: int | None = None,
         agent_id: str | None = None,
     ) -> list[MemoryRecord]:
-        del query, limit
-        return self.context_memories(tenant_id, user_id, agent_id=agent_id)
+        """按 query 做相关性召回:词项重合 + 重要度 + 新近度加权排序。
+
+        无任何词项命中时回退时间序,保证 recall 始终能给出可用上下文。
+        """
+        effective_limit = limit or DEFAULT_RECALL_LIMIT
+        candidates = [
+            row
+            for row in self._list_user_memories(
+                tenant_id,
+                user_id,
+                limit=RECALL_CANDIDATE_POOL,
+                agent_id=agent_id,
+            )
+            if row.kind in ALLOWED_MEMORY_KINDS
+        ]
+        terms = _query_terms(query)
+        if not terms:
+            return candidates[:effective_limit]
+        now = utc_now()
+        scored = [
+            (_memory_relevance(row, terms, now), row)
+            for row in candidates
+        ]
+        scored = [(score, row) for score, row in scored if score > 0]
+        if not scored:
+            return candidates[:effective_limit]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [row for _, row in scored[:effective_limit]]
 
     def context_memories(
         self,
@@ -410,6 +440,29 @@ def _normalize_importance(value: Any) -> float:
 def _memory_matches_key(record: MemoryRecord, key: str) -> bool:
     metadata = record.metadata_json or {}
     return metadata.get("key") == key
+
+
+def _query_terms(query: str) -> list[str]:
+    return [term for term in re.split(r"\s+", (query or "").strip().lower()) if term]
+
+
+def _memory_relevance(record: MemoryRecord, terms: list[str], now: datetime) -> float:
+    haystack = " ".join(
+        [
+            record.content or "",
+            str((record.metadata_json or {}).get("key") or ""),
+            record.kind or "",
+        ]
+    ).lower()
+    overlap = sum(1 for term in terms if term in haystack)
+    if overlap == 0:
+        return 0.0
+    age_days = 0.0
+    if record.updated_at is not None:
+        age_days = max((now - record.updated_at).total_seconds() / 86400.0, 0.0)
+    recency = max(0.0, 1.0 - age_days / 30.0)
+    importance = float(record.importance or 0.0)
+    return overlap * 2.0 + importance + recency
 
 
 def _read_dedupe_key(record: MemoryRecord) -> str:

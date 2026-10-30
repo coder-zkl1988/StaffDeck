@@ -173,6 +173,18 @@ def _pilotdeck_proxy_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=10.0, read=None, write=600.0, pool=10.0)
 
 
+# 复用的代理客户端:每请求新建/关闭 AsyncClient 会反复握手并泄漏连接
+_shared_proxy_clients: dict[str, httpx.AsyncClient] = {}
+
+
+def _shared_async_client(slot: str, timeout: httpx.Timeout) -> httpx.AsyncClient:
+    client = _shared_proxy_clients.get(slot)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=timeout)
+        _shared_proxy_clients[slot] = client
+    return client
+
+
 @app.middleware("http")
 async def pilotdeck_host_proxy(request: Request, call_next):  # noqa: ANN001
     """Route the PilotDeck virtual host or /pilotdeck prefix through this process."""
@@ -193,7 +205,7 @@ async def pilotdeck_host_proxy(request: Request, call_next):  # noqa: ANN001
     if request.client:
         request_headers["x-forwarded-for"] = request.client.host
 
-    client = httpx.AsyncClient(timeout=_pilotdeck_proxy_timeout())
+    client = _shared_async_client("pilotdeck", _pilotdeck_proxy_timeout())
     upstream_request = client.build_request(
         request.method,
         _pilotdeck_target_url(upstream_path, request.url.query),
@@ -203,7 +215,6 @@ async def pilotdeck_host_proxy(request: Request, call_next):  # noqa: ANN001
     try:
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
-        await client.aclose()
         raise HTTPException(status_code=502, detail="PilotDeck upstream unavailable") from exc
 
     response_headers = {
@@ -222,7 +233,6 @@ async def pilotdeck_host_proxy(request: Request, call_next):  # noqa: ANN001
                 yield chunk
         finally:
             await upstream_response.aclose()
-            await client.aclose()
 
     return StreamingResponse(
         stream_body(),
@@ -388,18 +398,14 @@ async def site_chat_proxy(site_path: str, request: Request) -> StreamingResponse
     if request.client:
         request_headers["x-forwarded-for"] = request.client.host
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+    client = _shared_async_client("site_chat", httpx.Timeout(600.0, connect=10.0))
     upstream_request = client.build_request(
         request.method,
         target_url,
         headers=request_headers,
         content=await request.body(),
     )
-    try:
-        upstream_response = await client.send(upstream_request, stream=True)
-    except Exception:
-        await client.aclose()
-        raise
+    upstream_response = await client.send(upstream_request, stream=True)
 
     response_headers = {
         key: value
@@ -414,7 +420,6 @@ async def site_chat_proxy(site_path: str, request: Request) -> StreamingResponse
                 yield chunk
         finally:
             await upstream_response.aclose()
-            await client.aclose()
 
     return StreamingResponse(
         stream_body(),
@@ -479,8 +484,8 @@ async def _relay_llm_request(
         if key.lower() in LLM_RELAY_REQUEST_HEADERS
     }
 
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
+    client = _shared_async_client(
+        "llm_relay", httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
     )
     upstream_request = client.build_request(
         "POST",
@@ -491,7 +496,6 @@ async def _relay_llm_request(
     try:
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
-        await client.aclose()
         raise HTTPException(status_code=502, detail="LLM relay upstream unavailable") from exc
 
     response_headers = {
@@ -507,7 +511,6 @@ async def _relay_llm_request(
                 yield chunk
         finally:
             await upstream_response.aclose()
-            await client.aclose()
 
     return StreamingResponse(
         stream_body(),

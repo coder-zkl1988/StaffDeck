@@ -26,7 +26,15 @@ from test_teams_bidding import (
 from app.api import chat as chat_api
 from app.api import teams as teams_api
 from app.core import AgentLoop
-from app.db.models import AgentEvent, ChatSession, Message, TeamTask, TeamWakeEvent
+from app.db.models import (
+    AgentEvent,
+    ChatSession,
+    Message,
+    Team,
+    TeamTask,
+    TeamWakeEvent,
+    Tenant,
+)
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse, SessionPublic
 from app.teams import wakeup
 from app.teams.schema import TeamTLChatRequest
@@ -252,7 +260,7 @@ def test_conversations_endpoint_kinds_preview_order_isolation() -> None:
         db.commit()
 
         # 本租户普通成员可读(对齐 GET tasks)
-        response = teams_api.list_team_conversations(team.id, "tenant_demo", db, _member_user())
+        response = teams_api.list_team_conversations(team.id, "tenant_demo", db, _admin_user())
         assert response.team_id == team.id
         assert response.team_name == team.name
         assert response.tl is not None
@@ -287,7 +295,7 @@ def test_conversations_endpoint_kinds_preview_order_isolation() -> None:
         ]
 
         # team2 视角:只有自己的会话;有 TL 但无 TL 会话时 session_id 为 None
-        other = teams_api.list_team_conversations(team2.id, "tenant_demo", db, _member_user())
+        other = teams_api.list_team_conversations(team2.id, "tenant_demo", db, _admin_user())
         assert [item.session_id for item in other.conversations] == [s_other.id]
         assert other.tl is not None
         assert other.tl.agent_id == "agent_worker2"
@@ -332,7 +340,7 @@ def test_conversations_expose_member_question_waiting_for_user_input() -> None:
         db.commit()
 
         response = teams_api.list_team_conversations(
-            team.id, "tenant_demo", db, _member_user()
+            team.id, "tenant_demo", db, _admin_user()
         )
         row = next(item for item in response.conversations if item.session_id == session.id)
 
@@ -383,7 +391,7 @@ def test_conversation_stream_returns_incremental_member_reply() -> None:
         db.commit()
 
         running = teams_api.get_team_conversation_stream(
-            team.id, session.id, "tenant_demo", db, _member_user()
+            team.id, session.id, "tenant_demo", db, _admin_user()
         )
         assert running.status == "running"
         assert running.content == "正在整理采购清单"
@@ -400,7 +408,7 @@ def test_conversation_stream_returns_incremental_member_reply() -> None:
         db.commit()
 
         completed = teams_api.get_team_conversation_stream(
-            team.id, session.id, "tenant_demo", db, _member_user()
+            team.id, session.id, "tenant_demo", db, _admin_user()
         )
         assert completed.status == "completed"
         assert completed.content == "正在整理采购清单"
@@ -442,7 +450,7 @@ def test_conversation_messages_endpoint_order_and_isolation() -> None:
         db.commit()
 
         rows = teams_api.list_team_conversation_messages(
-            team.id, session.id, "tenant_demo", db, _member_user()
+            team.id, session.id, "tenant_demo", db, _admin_user()
         )
         assert [row.id for row in rows] == ["m1", "m2"]
         assert rows[0].role == "user"
@@ -508,7 +516,7 @@ def test_conversation_messages_reuse_chat_metadata_and_hide_only_team_control_js
         db.commit()
 
         [row] = teams_api.list_team_conversation_messages(
-            team.id, session.id, "tenant_demo", db, _member_user()
+            team.id, session.id, "tenant_demo", db, _admin_user()
         )
 
         assert row.turn_id == "turn_structured_reply"
@@ -674,7 +682,42 @@ def test_team_threads_scope_tl_sessions_by_team_with_shared_tl() -> None:
         )
         db.commit()
 
-        threads = teams_api.list_team_threads("tenant_demo", db, _member_user())
+        threads = teams_api.list_team_threads("tenant_demo", db, _admin_user())
         tl_threads = [item for item in threads if item.kind == "tl_chat"]
         by_session = {item.session_id: item.team_id for item in tl_threads}
         assert by_session == {session_a.id: team_a.id, session_b.id: team_b.id}
+
+
+def test_team_conversations_rejected_for_non_owner_member() -> None:
+    """非团队创建者的普通成员不能读取团队会话(对齐 chat 会话 owner/admin 规则)。"""
+    with _test_session() as db:
+        team = Team(
+            id="team_guard",
+            tenant_id="tenant_demo",
+            name="团队A",
+            description=None,
+            owner_user_id="user_admin",
+        )
+        session = _make_session(
+            db, session_id="sess_guard", team_id=team.id, agent_id="agent_tl",
+            title="团队 A · TL 对话", created_at=datetime(2026, 1, 1, 10, 0, 0),
+        )
+        db.add(team)
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as list_error:
+            teams_api.list_team_conversations(team.id, "tenant_demo", db, _member_user())
+        assert list_error.value.status_code == 403
+
+        with pytest.raises(HTTPException) as messages_error:
+            teams_api.list_team_conversation_messages(
+                team.id, session.id, "tenant_demo", db, _member_user()
+            )
+        assert messages_error.value.status_code == 403
+
+        with pytest.raises(HTTPException) as stream_error:
+            teams_api.get_team_conversation_stream(
+                team.id, session.id, "tenant_demo", db, _member_user()
+            )
+        assert stream_error.value.status_code == 403

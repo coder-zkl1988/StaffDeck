@@ -6,7 +6,7 @@ import queue
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
@@ -546,6 +546,24 @@ def _stdio_command(config: dict[str, Any]) -> list[str]:
     if not isinstance(args, list):
         raise MCPClientError("stdio MCP 连接的 args 必须是数组。")
     return [*parts, *[str(arg) for arg in args]]
+
+
+def adhoc_stdio_command_allowed(
+    config: dict[str, Any], allowed_commands: Iterable[str]
+) -> bool:
+    """成员可用的 adhoc stdio 配置(探测/发现)是否在命令白名单内。
+
+    白名单按可执行文件 basename 匹配(忽略路径),例如 ``/usr/local/bin/npx``
+    命中 ``npx``。保存的 MCP server 由管理员维护,不走此校验。
+    """
+    allowed = {str(item).strip().lower() for item in allowed_commands if str(item)}
+    if not allowed:
+        return False
+    try:
+        command = _stdio_command(config)
+    except MCPClientError:
+        return False
+    return Path(command[0]).name.lower() in allowed
 
 
 def _validate_stdio_launch(command: list[str], cwd: str | None) -> None:

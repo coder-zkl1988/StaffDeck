@@ -258,6 +258,9 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
         thread.join()
         raise
     thread.join(timeout=1)
+    # 结束当前读事务:worker 线程的提交在旧快照里不可见(SQLite WAL),
+    # 不 commit 的话最终一轮 relay 会随机漏掉事件
+    db.commit()
     _relay_agent_events(db, job, session_id, seen_event_ids)
     if "error" in worker_result:
         raise worker_result["error"]

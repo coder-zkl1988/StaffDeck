@@ -90,6 +90,10 @@ class FeishuTraceStreamer:
         compact_sop: bool | None = None,
     ) -> None:
         self._binding = binding
+        # worker 线程只使用标量快照:主线程 Session 的 commit 会让 ORM 对象
+        # 过期,跨线程懒刷新会抛错并被吞掉(表现为"思考中"卡片静默消失)
+        self._binding_id = str(binding.id)
+        self._tenant_id = str(binding.tenant_id)
         self._target = dict(target or {})
         self._turn_id = str(turn_id or "").strip()
         self._adapter = adapter
@@ -162,7 +166,7 @@ class FeishuTraceStreamer:
             except Exception:
                 logger.exception(
                     "飞书 trace worker 任务执行失败 binding=%s turn=%s",
-                    self._binding.id,
+                    self._binding_id,
                     self._turn_id,
                 )
             # 任务执行后再次检查：若已在 draining 且队列空，退出
@@ -208,14 +212,27 @@ class FeishuTraceStreamer:
         return self._tool_names
 
     def _ensure_trace_names(self) -> None:
-        if self._db is None or self._names_loaded:
+        if self._names_loaded:
             return
         try:
-            skill_names, step_names, tool_names = _load_skill_trace_names(
-                self._db, self._binding.tenant_id
-            )
+            if self._db is not None:
+                # Tests and synchronous callers may provide their own short-lived session.
+                skill_names, step_names, tool_names = _load_skill_trace_names(
+                    self._db, self._tenant_id
+                )
+            else:
+                # The worker must not reuse the main thread's ORM session. A commit there can
+                # expire ChannelBinding and make a cross-thread lazy refresh fail silently.
+                from sqlmodel import Session
+
+                from app.db import engine
+
+                with Session(engine) as db:
+                    skill_names, step_names, tool_names = _load_skill_trace_names(
+                        db, self._tenant_id
+                    )
         except Exception:
-            logger.exception("飞书 trace 流式器加载技能名称失败 tenant=%s", self._binding.tenant_id)
+            logger.exception("飞书 trace 流式器加载技能名称失败 tenant=%s", self._tenant_id)
             return
         self._names_loaded = True
         if not self._skill_names:
@@ -243,7 +260,7 @@ class FeishuTraceStreamer:
         except Exception:
             logger.exception(
                 "飞书 trace 事件处理失败 binding=%s turn=%s event=%s",
-                self._binding.id,
+                self._binding_id,
                 self._turn_id,
                 event_type,
             )
@@ -278,7 +295,7 @@ class FeishuTraceStreamer:
         self._stop_worker()
         logger.info(
             "飞书 trace 流式器中止 binding=%s turn=%s reason=%s",
-            self._binding.id,
+            self._binding_id,
             self._turn_id,
             reason,
         )
@@ -353,13 +370,13 @@ class FeishuTraceStreamer:
         try:
             adapter = self._ensure_adapter()
             card = self._render_card(state="running")
-            idempotency_key = f"feishu-trace:{self._binding.id}:{self._turn_id}"
+            idempotency_key = f"feishu-trace:{self._binding_id}:{self._turn_id}"
             self._message_id = adapter.create_card(
                 self._binding, self._target, card, idempotency_key=idempotency_key
             )
         except Exception:
             logger.exception(
-                "飞书 trace 卡片创建失败 binding=%s turn=%s", self._binding.id, self._turn_id
+                "飞书 trace 卡片创建失败 binding=%s turn=%s", self._binding_id, self._turn_id
             )
             self._message_id = None
         finally:
@@ -399,7 +416,7 @@ class FeishuTraceStreamer:
         except Exception:
             logger.exception(
                 "飞书 trace 卡片更新失败 binding=%s message_id=%s",
-                self._binding.id,
+                self._binding_id,
                 self._message_id,
             )
 

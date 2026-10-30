@@ -37,8 +37,12 @@ export default function TracesPage() {
   const pagination = useClientPagination(rows, TRACES_PAGE_SIZE);
 
   async function openDetail(row: TraceSummary) {
-    const result = await api.get<Record<string, unknown>>(`/api/enterprise/traces/${row.session_id}?tenant_id=${TENANT_ID}`);
-    setDetail(result);
+    try {
+      const result = await api.get<Record<string, unknown>>(`/api/enterprise/traces/${row.session_id}?tenant_id=${TENANT_ID}`);
+      setDetail(result);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '拉取 Trace 详情失败,请重试');
+    }
   }
 
   const truncateCell = 'block truncate';

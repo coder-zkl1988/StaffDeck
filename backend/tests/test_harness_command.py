@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -412,6 +413,37 @@ def test_bubblewrap_network_policy_is_exact(tmp_path: Path) -> None:
     assert unsupported.value.error.code == "SANDBOX_POLICY_UNSUPPORTED"
 
 
+def test_seatbelt_profile_escapes_dynamic_paths(tmp_path: Path) -> None:
+    workspace = (tmp_path / 'workspace")) (allow file-read*) ;').resolve()
+    runtime = (tmp_path / 'runtime\\"quoted').resolve()
+    workspace.mkdir()
+    runtime.mkdir()
+
+    argv = command_module._bubblewrap_argv(
+        sandbox_executable="/usr/bin/sandbox-exec",
+        workspace=workspace,
+        command="true",
+        backend="seatbelt",
+        extra_readonly_paths=(runtime,),
+    )
+
+    profile = argv[2]
+    escaped_workspace = str(workspace).replace("\\", "\\\\").replace('"', '\\"')
+    escaped_runtime = str(runtime).replace("\\", "\\\\").replace('"', '\\"')
+    assert f'(subpath "{escaped_workspace}")' in profile
+    assert f'(subpath "{escaped_runtime}")' in profile
+
+
+@pytest.mark.parametrize("invalid_character", ["\x00", "\r", "\n"])
+def test_seatbelt_profile_rejects_control_characters(
+    invalid_character: str,
+) -> None:
+    with pytest.raises(HarnessExecutionError) as denied:
+        command_module._seatbelt_string_literal(f"/tmp/a{invalid_character}b")
+
+    assert denied.value.error.code == "SANDBOX_POLICY_INVALID"
+
+
 def test_srt_all_network_requires_reviewed_runtime_patch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -581,6 +613,143 @@ def test_packaged_windows_shell_aliases_bundled_python(tmp_path: Path, monkeypat
 
     assert "Set-Alias -Name python3" in script
     assert str(runtime / "python.exe") in script
+
+
+def test_packaged_macos_command_environment_prefers_bundled_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = tmp_path / "StaffDeck.app"
+    executable = app / "Contents" / "MacOS" / "staffdeck"
+    runtime_bin = app / "Contents" / "Resources" / "runtime" / "bin"
+    runtime_bin.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"app")
+    (runtime_bin / "python3").write_bytes(b"python")
+    (runtime_bin / "python3").chmod(0o755)
+    monkeypatch.setattr(command_module.sys, "platform", "darwin")
+    monkeypatch.setattr(command_module.sys, "executable", str(executable))
+
+    environment = command_module._managed_process_environment(None)
+
+    assert environment["PATH"].split(os.pathsep)[0] == str(runtime_bin)
+
+
+@pytest.mark.parametrize("app_name", ["StaffDeck.app", "Staff:Deck.app"])
+def test_packaged_macos_runtime_fails_closed_when_path_is_unsafe_or_python_not_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    app_name: str,
+) -> None:
+    app = tmp_path / app_name
+    executable = app / "Contents" / "MacOS" / "staffdeck"
+    runtime_python = app / "Contents" / "Resources" / "runtime" / "bin" / "python3"
+    runtime_python.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"app")
+    runtime_python.write_bytes(b"python")
+    if os.pathsep in app_name:
+        runtime_python.chmod(0o755)
+    monkeypatch.setattr(command_module.sys, "platform", "darwin")
+    monkeypatch.setattr(command_module.sys, "executable", str(executable))
+
+    assert command_module._bundled_runtime_root() is None
+    assert command_module._managed_process_environment(None)["PATH"] == (
+        "/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+
+
+def test_packaged_macos_exec_command_allows_bundled_python_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = tmp_path / "StaffDeck.app"
+    executable = app / "Contents" / "MacOS" / "staffdeck"
+    runtime_root = app / "Contents" / "Resources" / "runtime"
+    runtime_bin = runtime_root / "bin"
+    runtime_bin.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"app")
+    (runtime_bin / "python3").write_bytes(b"python")
+    (runtime_bin / "python3").chmod(0o755)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(command_module.sys, "platform", "darwin")
+    monkeypatch.setattr(command_module.sys, "executable", str(executable))
+    monkeypatch.setattr(command_module, "available_backend", lambda: "seatbelt")
+    monkeypatch.setattr(command_module, "ensure_backend_usable", lambda _backend: None)
+    monkeypatch.setattr(command_module, "_seatbelt_executable", lambda: "/usr/bin/sandbox-exec")
+
+    def fake_run(argv, **_kwargs):
+        captured["argv"] = list(argv)
+        return command_module._BoundedProcessResult(
+            returncode=0,
+            stdout=b"ok",
+            stderr=b"",
+            stdout_bytes=2,
+            stderr_bytes=0,
+            timed_out=False,
+            output_truncated=False,
+            duration_ms=1,
+        )
+
+    monkeypatch.setattr(command_module, "_run_bounded_process", fake_run)
+
+    result = _execute(tmp_path, {"command": "python3 --version"})
+
+    assert result.success is True
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert f'(allow file-read* (subpath "{runtime_root}"))' in argv[2]
+
+
+def test_packaged_linux_bubblewrap_mounts_and_prefers_bundled_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "StaffDeck" / "staffdeck"
+    runtime_root = executable.parent / "runtime"
+    runtime_bin = runtime_root / "bin"
+    runtime_bin.mkdir(parents=True)
+    executable.write_bytes(b"app")
+    bundled_python = runtime_bin / "python3"
+    bundled_python.write_bytes(b"python")
+    bundled_python.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(command_module.sys, "platform", "linux")
+    monkeypatch.setattr(command_module.sys, "executable", str(executable))
+
+    argv = command_module._bubblewrap_argv(
+        sandbox_executable="/usr/bin/bwrap",
+        workspace=workspace,
+        command="python3 --version",
+        extra_readonly_paths=(runtime_root,),
+    )
+
+    runtime_index = argv.index(str(runtime_root))
+    assert argv[runtime_index - 1] == "--ro-bind"
+    assert argv[runtime_index + 1] == str(runtime_root)
+    path_index = argv.index("PATH")
+    assert argv[path_index + 1].split(os.pathsep)[0] == str(runtime_bin)
+
+
+def test_srt_settings_allow_read_for_bundled_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    runtime_root = tmp_path / "runtime"
+    workspace.mkdir()
+    runtime_root.mkdir()
+    monkeypatch.setattr(command_module, "_bundled_runtime_root", lambda: runtime_root)
+
+    settings_path = command_module._write_srt_settings(workspace, network_mode="deny")
+    try:
+        filesystem = json.loads(settings_path.read_text())["filesystem"]
+    finally:
+        settings_path.unlink()
+
+    assert filesystem["allowRead"] == [str(workspace.resolve()), str(runtime_root)]
 
 
 def test_srt_protects_frozen_default_database_without_blocking_workspace(

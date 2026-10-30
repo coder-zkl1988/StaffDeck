@@ -84,7 +84,10 @@ from app.general_skills.schema import GeneralSkillRunResponse
 from app.harness.errors import HarnessExecutionError
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.observability.event_log import EventLog
+from app.core.harness_turn_store import HarnessTurnConflict
 from app.scheduled_tasks.service import (
+    MAX_CONFLICT_RETRIES,
+    _execute_prepared_scheduled_task,
     _finish_task_schedule,
     _prepare_scheduled_task_run,
     _scheduled_harness_outcome,
@@ -1747,6 +1750,59 @@ def test_skip_misfire_records_skip_and_advances_past_backlog() -> None:
         assert task.run_count == 1
         assert task.next_run_at is not None
         assert task.next_run_at > now
+
+
+def test_conflict_retry_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """turn 冲突重试超过上限后必须显式失败,不能每 15s 永久空转。"""
+    engine = _test_engine()
+    now = utc_now()
+    with Session(engine) as db:
+        task = ScheduledTask(
+            id="scheduled-retry-cap",
+            tenant_id="tenant-demo",
+            agent_id="agent-1",
+            created_by_user_id="user-1",
+            title="冲突上限",
+            prompt="继续执行",
+            schedule_type="daily",
+            schedule_json={"time": "09:00"},
+            timezone="UTC",
+            status="active",
+            next_run_at=now,
+        )
+        run = ScheduledTaskRun(
+            id="scheduled-run-retry-cap",
+            tenant_id=task.tenant_id,
+            scheduled_task_id=task.id,
+            agent_id=task.agent_id,
+            user_id=task.created_by_user_id,
+            session_id="scheduled-session-retry-cap",
+            scheduled_for=now,
+            status="running",
+            retry_count=MAX_CONFLICT_RETRIES,
+        )
+        db.add(task)
+        db.add(run)
+        db.commit()
+
+        class _ConflictLoop:
+            def __init__(self, _db):  # noqa: ANN001
+                pass
+
+            def handle_turn_stream(self, _request):  # noqa: ANN001
+                raise HarnessTurnConflict("simulated conflict")
+
+        monkeypatch.setattr(
+            "app.scheduled_tasks.service._ensure_scheduled_execution_agent",
+            lambda _db, _task: None,
+        )
+        monkeypatch.setattr("app.scheduled_tasks.service.AgentLoop", _ConflictLoop)
+
+        result = _execute_prepared_scheduled_task(db, task, run, manual=False)
+
+        assert result.status == "failed"
+        assert "放弃" in (result.error or "")
+        assert result.finished_at is not None
 
 
 def test_retrying_scheduled_run_reuses_same_run_and_session() -> None:

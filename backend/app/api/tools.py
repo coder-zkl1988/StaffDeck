@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -47,8 +50,10 @@ from app.tools.mcp_client import (
     MCP_APP_MIME_TYPE,
     MCP_APPS_EXTENSION_ID,
     MCPClientError,
+    adhoc_stdio_command_allowed,
     discover_mcp_server,
     execute_mcp_tool,
+    normalize_transport,
     read_mcp_resource,
 )
 from app.tools.tool_schema import (
@@ -257,6 +262,9 @@ def probe_tool(
     ensure_current_user_tenant(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
     if request.tool_type == "mcp":
+        blocked = _validate_adhoc_mcp_config(request.tenant_id, current_user, request.mcp_config)
+        if blocked is not None:
+            return ToolProbeResponse(success=False, status_code=400, error=blocked)
         timeout_seconds = _probe_timeout_seconds(request)
         try:
             data = execute_mcp_tool(
@@ -284,6 +292,11 @@ def probe_tool(
             error=None,
         )
     if request.tool_type == "a2a":
+        a2a_url = _normalize_probe_url(request.url or "")
+        if a2a_url and _probe_target_blocked(a2a_url):
+            return ToolProbeResponse(
+                success=False, status_code=400, error=_blocked_target_error(a2a_url)
+            )
         tool = Tool(
             tenant_id=request.tenant_id,
             name=request.name or "a2a_probe",
@@ -313,6 +326,8 @@ def probe_tool(
             error=result.error,
         )
     url = _normalize_probe_url(request.url)
+    if _probe_target_blocked(url):
+        return ToolProbeResponse(success=False, status_code=400, error=_blocked_target_error(url))
     executor = ToolExecutor(db)
     headers = executor._request_headers(
         url,
@@ -773,9 +788,92 @@ def _read_execution_policy(config: dict[str, Any]) -> ToolExecutionPolicy | None
 
 
 def _probe_timeout_seconds(request: ToolProbeRequest) -> float:
+    settings = get_settings()
     if request.execution_policy is not None:
-        return request.execution_policy.timeout_seconds
-    return get_settings().tool_timeout_seconds
+        value = request.execution_policy.timeout_seconds
+    else:
+        value = settings.tool_timeout_seconds
+    # 成员可用路径不接受小时级探测超时,统一夹到配置上限。
+    return max(0.1, min(value, settings.tool_probe_max_timeout_seconds))
+
+
+def _probe_target_blocked(url: str) -> bool:
+    """探测目标是否指向内网/保留地址(SSRF 防护)。
+
+    仅放行公网地址与 ``tool_base_url`` 自身(相对路径探测本应用 API 是合法场景)。
+    域名会即时解析后逐个 IP 判定,不在公网段即拒绝;域名解析失败则放行
+    (无法建立连接,不构成 SSRF)。注意:两次解析间的 DNS rebinding 不在此防护范围。
+    """
+    settings = get_settings()
+    if settings.tool_probe_allow_private_networks:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return True
+    if parsed.scheme not in {"http", "https"}:
+        return True
+    host = (parsed.hostname or "").strip().lower().split("%", 1)[0]
+    if not host:
+        return True
+    base_host = (urlparse(settings.normalized_tool_base_url).hostname or "").strip().lower()
+    if host == base_host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if not address.is_global:
+            return True
+    return False
+
+
+def _blocked_target_error(url: str) -> ToolError:
+    return ToolError(
+        code="PROBE_TARGET_BLOCKED",
+        message=(
+            f"探测目标被拒绝(内网/保留地址不受支持):{url}。"
+            "如需探测内网工具,请让管理员配置 TOOL_PROBE_ALLOW_PRIVATE_NETWORKS。"
+        ),
+    )
+
+
+def _validate_adhoc_mcp_config(
+    tenant_id: str, current_user: User, config: dict[str, Any] | None
+) -> ToolError | None:
+    """成员可用 adhoc 路径(probe/发现)的兜底约束。
+
+    - stdio transport:要求管理员,且命令必须在白名单内;
+    - http/sse transport:目标 URL 不得指向内网/保留地址。
+    """
+    if hasattr(config, "model_dump"):
+        config = config.model_dump(exclude_none=True)
+    if not isinstance(config, dict):
+        return None
+    transport = normalize_transport(config)
+    if transport == "stdio":
+        # 未鉴权到管理员会直接 403,白名单兜底防管理员误配置任意命令。
+        ensure_open_gallery_admin(tenant_id, current_user)
+        settings = get_settings()
+        if not adhoc_stdio_command_allowed(config, settings.mcp_stdio_allowed_command_list):
+            return ToolError(
+                code="STDIO_COMMAND_BLOCKED",
+                message=(
+                    "MCP stdio 探测仅允许白名单内的命令"
+                    f"({', '.join(settings.mcp_stdio_allowed_command_list)})。"
+                ),
+            )
+        return None
+    if transport in {"http", "sse"}:
+        url = str(config.get("url") or config.get("endpoint") or "")
+        if url and _probe_target_blocked(url):
+            return _blocked_target_error(url)
+    return None
 
 
 def _response_preview(response: httpx.Response) -> Any:
@@ -1120,6 +1218,9 @@ def discover_mcp_tools_adhoc(
             success=False,
             error=ToolError(code="MISSING_CONNECTION", message="缺少 MCP 连接配置。"),
         )
+    blocked = _validate_adhoc_mcp_config(request.tenant_id, current_user, request.connection)
+    if blocked is not None:
+        return MCPDiscoverResponse(success=False, error=blocked)
     return _discover_response(request.connection, apps_mode=request.apps_mode)
 
 

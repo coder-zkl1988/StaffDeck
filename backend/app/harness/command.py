@@ -188,6 +188,7 @@ def exec_command(
             )
             argv = _srt_argv(settings_path=settings_path, command=command)
         else:
+            runtime_root = _bundled_runtime_root()
             argv = _bubblewrap_argv(
                 sandbox_executable=_bubblewrap_executable()
                 if backend == "bubblewrap"
@@ -196,6 +197,7 @@ def exec_command(
                 command=command,
                 backend=backend,
                 env=None,
+                extra_readonly_paths=(runtime_root,) if runtime_root is not None else (),
                 network_mode=context.sandbox_network_mode,
             )
         process_kwargs: dict[str, Any] = {
@@ -276,10 +278,13 @@ def register_command_tools(registry: HarnessRegistry) -> HarnessRegistry:
             "statements, inside this TaskFrame workspace. "
             "Linux and macOS use Bash; Windows uses PowerShell. The selected OS "
             "sandbox makes only this workspace writable and applies the tenant's "
-            "configured network policy. On Windows do not use Bash syntax (heredoc, "
-            "python3, py -3, or bash chaining); use PowerShell statements. In a "
-            "packaged Windows build, python/python3 resolve to the bundled runtime; "
-            "in source deployments, use the General Skill Python runtime. Relative "
+            "configured network policy. On Linux and macOS, shell expansion, command "
+            "substitution, heredoc/here-string, process substitution, and background "
+            "processes are not allowed. Use write_file/edit_file to create scripts, "
+            "then execute the fixed path without shell variables. On Windows do not "
+            "use Bash syntax (heredoc, py -3, or Bash chaining); use PowerShell "
+            "statements. In packaged builds, python/python3 resolve to the bundled "
+            "runtime; in source deployments, use the General Skill Python runtime. Relative "
             "paths start in the TaskFrame workspace; absolute paths are accepted and "
             "remain subject to OS permissions and the configured sandbox policy."
         ),
@@ -685,10 +690,47 @@ def _unsandboxed_argv(command: str) -> list[str]:
 
 def _bundled_runtime_root() -> Path | None:
     """Return the frozen app's bundled Python directory, when present."""
-    if sys.platform != "win32":
+    executable_dir = Path(sys.executable).resolve().parent
+    if (
+        sys.platform == "darwin"
+        and executable_dir.name == "MacOS"
+        and executable_dir.parent.name == "Contents"
+    ):
+        root = executable_dir.parent / "Resources" / "runtime"
+    else:
+        root = executable_dir / "runtime"
+    python = root / "python.exe" if sys.platform == "win32" else root / "bin" / "python3"
+    if not python.is_file():
         return None
-    root = Path(sys.executable).resolve().parent / "runtime"
-    return root if (root / "python.exe").is_file() else None
+    if sys.platform != "win32" and (
+        not os.access(python, os.X_OK) or os.pathsep in str(root / "bin")
+    ):
+        return None
+    return root
+
+
+def _bundled_runtime_bin() -> Path | None:
+    runtime_root = _bundled_runtime_root()
+    if runtime_root is None:
+        return None
+    return runtime_root if sys.platform == "win32" else runtime_root / "bin"
+
+
+def _sandbox_path() -> str:
+    runtime_bin = _bundled_runtime_bin()
+    if runtime_bin is None:
+        return _SANDBOX_PATH
+    return f"{runtime_bin}{os.pathsep}{_SANDBOX_PATH}"
+
+
+def _seatbelt_string_literal(value: str) -> str:
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        raise HarnessExecutionError(
+            "SANDBOX_POLICY_INVALID",
+            "Seatbelt paths cannot contain NUL or newline characters.",
+        )
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _bubblewrap_argv(
@@ -713,20 +755,29 @@ def _bubblewrap_argv(
             )
         # Deny by default, keep the task workspace writable, and permit only
         # read access to the system runtime needed by basic shell commands.
+        # /private/etc 只放行最小运行时子集(与 Linux 侧 _READ_ONLY_SYSTEM_PATHS
+        # 对齐),不再整目录可读——服务可能以 root 运行,整包 /etc 会暴露宿主机凭据。
+        workspace_literal = _seatbelt_string_literal(str(workspace))
         profile = (
             "(version 1) (deny default) "
             "(allow process*) (allow sysctl-read) "
             f'(allow file-read* (subpath "/usr")) '
             f'(allow file-read* (subpath "/bin")) '
-            f'(allow file-read* (subpath "/private/etc")) '
-            f'(allow file-read* (subpath "{workspace}")) '
-            f'(allow file-write* (subpath "{workspace}")) '
+            '(allow file-read* (subpath "/private/etc/hosts")) '
+            '(allow file-read* (subpath "/private/etc/resolv.conf")) '
+            '(allow file-read* (subpath "/private/etc/localtime")) '
+            '(allow file-read* (subpath "/private/etc/passwd")) '
+            '(allow file-read* (subpath "/private/etc/group")) '
+            '(allow file-read* (subpath "/private/etc/ssl")) '
+            f"(allow file-read* (subpath {workspace_literal})) "
+            f"(allow file-write* (subpath {workspace_literal})) "
             + ("(deny network*)" if network_mode == "deny" else "(allow network*)")
         )
         for raw_path in dict.fromkeys(str(path.resolve()) for path in extra_readonly_paths):
             path = Path(raw_path)
             if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
-                profile += f' (allow file-read* (subpath "{raw_path}"))'
+                path_literal = _seatbelt_string_literal(raw_path)
+                profile += f" (allow file-read* (subpath {path_literal}))"
         return [
             _seatbelt_executable(),
             "-p",
@@ -795,7 +846,7 @@ def _bubblewrap_argv(
             SANDBOX_WORKSPACE,
             "--setenv",
             "PATH",
-            _SANDBOX_PATH,
+            _sandbox_path(),
             "--setenv",
             "LANG",
             "C.UTF-8",
@@ -838,8 +889,12 @@ def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
         }
         baseline = {key: os.environ[key] for key in system_keys if key in os.environ}
     else:
+        runtime_bin = _bundled_runtime_bin()
+        path = "/usr/sbin:/usr/bin:/sbin:/bin"
+        if runtime_bin is not None:
+            path = f"{runtime_bin}{os.pathsep}{path}"
         baseline = {
-            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": path,
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
         }

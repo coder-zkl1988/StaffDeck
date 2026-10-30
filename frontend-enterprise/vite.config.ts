@@ -15,6 +15,32 @@ export default defineConfig(({ mode }) => {
       },
     },
     base: '/',
+    build: {
+      rollupOptions: {
+        output: {
+          // 厂商依赖独立分包:主包只留业务代码,长缓存友好
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return undefined;
+            if (id.includes('radix-ui') || id.includes('@radix-ui')) {
+              return 'vendor-radix';
+            }
+            if (id.includes('react-router') || id.includes('react-dom') || id.includes('/react/')) {
+              return 'vendor-react';
+            }
+            if (id.includes('marked') || id.includes('highlight.js') || id.includes('dompurify')) {
+              return 'vendor-markdown';
+            }
+            if (id.includes('lucide-react')) {
+              return 'vendor-icons';
+            }
+            if (id.includes('cytoscape')) {
+              return 'vendor-cytoscape';
+            }
+            return 'vendor-misc';
+          },
+        },
+      },
+    },
     test: {
       setupFiles: ['./src/test/setup.ts'],
       environmentOptions: {

@@ -1,8 +1,9 @@
 import base64
 
 import pytest
+from fastapi import HTTPException
 
-from app.api.chat import _user_message_metadata
+from app.api.chat import _user_message_metadata, _validate_chat_turn_attachments
 from app.channels.media import normalize_image_media
 from app.session.attachments import (
     image_payloads_from_attachments,
@@ -151,6 +152,41 @@ def test_turn_attachment_round_trip_enforces_count_and_size_limits() -> None:
             max_attachments=1,
             max_attachment_bytes=8,
         )
+
+
+def test_chat_turn_accepts_one_hundred_attachments_and_rejects_one_hundred_one() -> None:
+    attachments = [
+        ChatAttachmentRead(
+            id=f"file-{index}",
+            filename=f"document-{index}.txt",
+            content_type="text/plain",
+            size=0,
+            kind="text",
+        )
+        for index in range(101)
+    ]
+
+    normalized = _validate_chat_turn_attachments(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            message="处理附件",
+            attachments=attachments[:100],
+        )
+    )
+
+    assert len(normalized.attachments) == 100
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_chat_turn_attachments(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                message="处理附件",
+                attachments=attachments,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "最多携带 100 个附件"
 
 
 def test_turn_attachment_round_trip_recomputes_untrusted_summary() -> None:

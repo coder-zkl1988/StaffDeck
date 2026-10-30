@@ -40,6 +40,8 @@ class User(SQLModel, table=True):
     # 账号来源:web=网页端创建;wechat 等=渠道懒建(用户管理列表默认隐藏)
     source: str = Field(default="web", index=True)
     password_hash: str
+    # token 代次:改密/登出时 +1,旧 bearer token 立即失效(吊销机制)
+    token_version: int = Field(default=0)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1215,6 +1217,7 @@ class ScheduledTaskRun(SQLModel, table=True):
     session_id: Optional[str] = Field(default=None, index=True)
     scheduled_for: datetime = Field(index=True)
     status: str = Field(default="queued", index=True)
+    retry_count: int = Field(default=0)
     started_at: Optional[datetime] = Field(default=None, index=True)
     finished_at: Optional[datetime] = Field(default=None, index=True)
     result_summary: Optional[str] = None

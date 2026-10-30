@@ -5,7 +5,7 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location $Repo
-if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
+if (-not $env:VERSION) { $env:VERSION = "0.5.1" }
 
 function Test-SigningConfigured {
   return [bool](

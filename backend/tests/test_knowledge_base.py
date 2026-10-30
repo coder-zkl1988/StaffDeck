@@ -5,12 +5,17 @@ from datetime import timedelta
 from io import BytesIO
 
 import pytest
+from fastapi import HTTPException
 from docx import Document
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.agents.branching import ensure_open_gallery_binding
+from app.agents.branching import (
+    ensure_open_gallery_binding,
+    hide_open_gallery_binding,
+)
 from app.api.knowledge import (
+    _ensure_open_gallery_knowledge_admin,
     confirm_discovery as confirm_discovery_api,
     list_documents,
     search_knowledge,
@@ -52,6 +57,7 @@ from app.knowledge.service import (
     _score_documents,
     _score_text,
     _select_diverse_chunk_hits,
+    recover_stale_ingest_jobs,
     validate_discovered_skill,
 )
 from app.llm import LLMClient
@@ -1007,6 +1013,7 @@ def test_update_document_syncs_document_card_and_okf_source_concept() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        _seed_kb_overall_binding(db)
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1072,6 +1079,7 @@ def test_update_document_syncs_document_card_and_okf_source_concept() -> None:
             document.id,
             KnowledgeDocumentUpdateRequest(tenant_id="tenant_demo", title="新标题"),
             db,
+            _admin_user(),
         )
 
         assert updated.title == "新标题"
@@ -1092,6 +1100,7 @@ def test_update_document_content_rebuilds_all_derived_knowledge() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        _seed_kb_overall_binding(db)
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1163,6 +1172,7 @@ def test_update_document_content_rebuilds_all_derived_knowledge() -> None:
                 expected_updated_at=document.updated_at.isoformat(),
             ),
             db,
+            _admin_user(),
         )
 
         assert updated.title == "新版制度"
@@ -1218,6 +1228,7 @@ def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        _seed_kb_overall_binding(db)
         db.add(
             KnowledgeBaseVersion(
                 id="kbv_demo",
@@ -1273,6 +1284,7 @@ def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
             chunk.id,
             KnowledgeChunkUpdateRequest(tenant_id="tenant_demo", content="新退款规则内容", summary="新摘要"),
             db,
+            _admin_user(),
         )
 
         refreshed_bucket = db.get(KnowledgeBucket, bucket.id)
@@ -1286,6 +1298,42 @@ def test_update_chunk_refreshes_bucket_content_and_okf_topic() -> None:
             )
         ).one()
         assert "新退款规则内容" in topic.content_md
+
+
+def test_hidden_gallery_knowledge_base_writes_fail_closed() -> None:
+    """被隐藏/解绑的画廊 KB 与跨租户 KB 的写入必须显式拒绝(fail-closed)。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_other", name="Other"))
+        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.add(KnowledgeBase(id="kb_other", tenant_id="tenant_other", name="他租户"))
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.flush()
+        ensure_open_gallery_binding(db, "tenant_demo", "knowledge_base", "kb_demo", "active")
+        hide_open_gallery_binding(db, "tenant_demo", "knowledge_base", "kb_demo")
+        db.commit()
+        admin = _admin_user()
+
+        # 同租户但画廊绑定已被删除 → 403
+        with pytest.raises(HTTPException) as hidden_error:
+            _ensure_open_gallery_knowledge_admin(db, "tenant_demo", "kb_demo", admin)
+        assert hidden_error.value.status_code == 403
+
+        # 跨租户 KB → 404,不泄露存在性
+        with pytest.raises(HTTPException) as cross_error:
+            _ensure_open_gallery_knowledge_admin(db, "tenant_demo", "kb_other", admin)
+        assert cross_error.value.status_code == 404
+
+        # 活跃画廊绑定 + 管理员 → 放行
+        ensure_open_gallery_binding(
+            db, "tenant_demo", "knowledge_base", "kb_demo", "active", revive=True
+        )
+        db.commit()
+        _ensure_open_gallery_knowledge_admin(db, "tenant_demo", "kb_demo", admin)
 
 
 def test_confirm_discovery_is_required_before_tool_or_skill_enters_runtime() -> None:
@@ -1344,6 +1392,7 @@ def test_confirm_discovery_api_returns_422_for_invalid_skill() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        _seed_kb_overall_binding(db)
         user = User(
             id="user_admin",
             tenant_id="tenant_demo",
@@ -1374,6 +1423,7 @@ def test_confirm_discovery_api_returns_409_for_non_pending_status() -> None:
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        _seed_kb_overall_binding(db)
         user = User(
             id="user_admin",
             tenant_id="tenant_demo",
@@ -1707,6 +1757,88 @@ def test_discovery_only_marks_valid_skill_as_pending(monkeypatch: pytest.MonkeyP
 
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _admin_user() -> User:
+    return User(
+        id="user_admin",
+        tenant_id="tenant_demo",
+        username="admin",
+        role="admin",
+        password_hash="unused",
+    )
+
+
+def _seed_kb_overall_binding(db) -> None:  # noqa: ANN001
+    """补齐真实创建流程的前提:KB 建立整体 agent 的开放画廊绑定。"""
+    if not db.get(AgentProfile, "agent_overall"):
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+    db.flush()
+    ensure_open_gallery_binding(db, "tenant_demo", "knowledge_base", "kb_demo", "active")
+    db.commit()
+
+
+def test_ingest_failure_with_poisoned_session_still_persists_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败发生在坏事务中时,先回滚再落库:job 必须收敛到 failed 且清掉 base64。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.commit()
+        service = KnowledgeService(db)
+        job = service.create_ingest_job(
+            IngestPayload(
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_demo",
+                filename="policy.md",
+                content_base64=_b64("# 售后政策\n用户可查询订单。"),
+            )
+        )
+
+        def _poison(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            # 重复主键让 flush 抛 IntegrityError,模拟半途失败的坏事务
+            db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="重复"))
+            db.flush()
+            raise RuntimeError("poisoned after flush")
+
+        monkeypatch.setattr(KnowledgeService, "_discover_from_document", _poison)
+
+        service._run_ingest_job(job.id)  # noqa: SLF001
+
+        job = db.get(KnowledgeIngestJob, job.id)
+        assert job is not None
+        assert job.status == "failed"
+        assert job.finished_at is not None
+        assert "content_base64" not in (job.metadata_json or {})
+
+
+def test_recover_stale_ingest_jobs_finalizes_and_clears_payload() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        job = KnowledgeIngestJob(
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_demo",
+            filename="x.md",
+            status="running",
+            stage="parsing",
+            metadata_json={"content_base64": "QUFB"},
+        )
+        job.updated_at = utc_now() - timedelta(minutes=60)
+        db.add(job)
+        db.commit()
+
+        recovered = recover_stale_ingest_jobs(db)
+
+        assert recovered == [job.id]
+        db.refresh(job)
+        assert job.status == "failed"
+        assert "content_base64" not in (job.metadata_json or {})
 
 
 def _test_session():

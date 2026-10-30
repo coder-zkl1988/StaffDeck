@@ -967,6 +967,15 @@ def move_file(
         overwrite=args.overwrite,
         expected_sha256=args.expected_destination_sha256,
     )
+    if not workspace.is_inside_workspace(source):
+        # 外部文件移入工作区会新增占用:与 copy 同样走单文件与工作区配额
+        workspace.ensure_file_size(source_metadata.st_size)
+        destination_size = destination.stat().st_size if destination.exists() else 0
+        workspace.ensure_workspace_capacity(
+            path=destination,
+            replacing_bytes=destination_size,
+            new_bytes=source_metadata.st_size,
+        )
     try:
         os.replace(source, destination)
     except OSError as exc:

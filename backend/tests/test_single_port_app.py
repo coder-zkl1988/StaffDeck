@@ -206,20 +206,26 @@ async def test_llm_relay_forwards_auth_body_query_and_stream(monkeypatch) -> Non
 
     monkeypatch.setattr(single_port_app, "LLM_RELAY_UPSTREAM", "https://llm.example")
     monkeypatch.setattr(single_port_app.httpx, "AsyncClient", FakeAsyncClient)
+    # 共享代理客户端按槽位缓存:清掉缓存保证本测试用的是 FakeAsyncClient,
+    # 并在结束后清掉 Fake 实例避免污染其他用例
+    single_port_app._shared_proxy_clients.clear()
     payload = b'{"model":"demo","stream":true}'
-    response = await single_port_app.llm_chat_completions_relay(
-        _request(
-            payload,
-            headers=[
-                (b"authorization", b"Bearer secret"),
-                (b"content-type", b"application/json"),
-                (b"cookie", b"must-not-leak=1"),
-                (b"x-request-id", b"request-local"),
-            ],
-            query_string=b"trace=true",
+    try:
+        response = await single_port_app.llm_chat_completions_relay(
+            _request(
+                payload,
+                headers=[
+                    (b"authorization", b"Bearer secret"),
+                    (b"content-type", b"application/json"),
+                    (b"cookie", b"must-not-leak=1"),
+                    (b"x-request-id", b"request-local"),
+                ],
+                query_string=b"trace=true",
+            )
         )
-    )
-    streamed = b"".join([chunk async for chunk in response.body_iterator])
+        streamed = b"".join([chunk async for chunk in response.body_iterator])
+    finally:
+        single_port_app._shared_proxy_clients.clear()
 
     assert captured["method"] == "POST"
     assert captured["url"] == (
@@ -232,7 +238,8 @@ async def test_llm_relay_forwards_auth_body_query_and_stream(monkeypatch) -> Non
         "x-request-id": "request-local",
     }
     assert captured["stream"] is True
-    assert captured["client_closed"] is True
+    # 客户端按槽位复用,不随单个请求关闭
+    assert "client_closed" not in captured
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/event-stream"
     assert "connection" not in response.headers

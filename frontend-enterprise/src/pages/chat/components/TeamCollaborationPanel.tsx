@@ -153,7 +153,11 @@ export function useTeamCollaborations(team?: TeamRead | null): TeamConversationR
       }
     };
     void loadConversations();
-    const pollTimer = window.setInterval(() => void loadConversations(), 2_000);
+    const pollTimer = window.setInterval(() => {
+      // 页面隐藏时暂停轮询,回到前台下一拍自动恢复
+      if (document.hidden) return;
+      void loadConversations();
+    }, 2_000);
     return () => {
       cancelled = true;
       window.clearInterval(pollTimer);
@@ -231,7 +235,10 @@ export default function TeamCollaborationPanel({
         refreshing = false;
       }
     };
-    pollTimer = window.setInterval(() => void refreshStream(), 400);
+    pollTimer = window.setInterval(() => {
+      if (document.hidden) return;
+      void refreshStream();
+    }, 400);
     void refreshStream();
     return () => {
       cancelled = true;

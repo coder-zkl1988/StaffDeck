@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import selectors
+import shutil
 import subprocess
 import sys
 import threading
@@ -655,6 +656,60 @@ class GeneralSkillRunner:
         sandbox_allowed_domains: tuple[str, ...] | None = None,
         sandbox_enabled: bool = True,
     ) -> tuple[str, str, dict[str, Any]]:
+        """执行一次 runner;非 harness 路径(无 workspace_root)的临时目录用后即清。"""
+        if workspace_root is not None:
+            return self._execute_plan_impl(
+                skill,
+                query,
+                plan,
+                user_id,
+                trace,
+                event_sink,
+                attempt,
+                workspace_root=workspace_root,
+                is_cancelled=is_cancelled,
+                sandbox_network_mode=sandbox_network_mode,
+                sandbox_allowed_domains=sandbox_allowed_domains,
+                sandbox_enabled=sandbox_enabled,
+            )
+        # 直连 API 调用路径:artifacts 本就不被保留(见 _normalize_declared_artifacts),
+        # 运行目录在 /tmp 下用完即删,避免永久泄漏
+        tmp_root = Path(mkdtemp(prefix="general_skill_run_"))
+        try:
+            return self._execute_plan_impl(
+                skill,
+                query,
+                plan,
+                user_id,
+                trace,
+                event_sink,
+                attempt,
+                workspace_root=None,
+                is_cancelled=is_cancelled,
+                sandbox_network_mode=sandbox_network_mode,
+                sandbox_allowed_domains=sandbox_allowed_domains,
+                sandbox_enabled=sandbox_enabled,
+                run_dir_parent=tmp_root,
+            )
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def _execute_plan_impl(
+        self,
+        skill: GeneralSkill,
+        query: str,
+        plan: GeneralSkillExecutionPlan,
+        user_id: str,
+        trace: list[dict[str, Any]],
+        event_sink: TraceSink | None = None,
+        attempt: int = 1,
+        workspace_root: Path | None = None,
+        is_cancelled: CancellationCheck | None = None,
+        sandbox_network_mode: str | None = None,
+        sandbox_allowed_domains: tuple[str, ...] | None = None,
+        sandbox_enabled: bool = True,
+        run_dir_parent: Path | None = None,
+    ) -> tuple[str, str, dict[str, Any]]:
         sandbox_network_mode = sandbox_network_mode or "all"
         sandbox_allowed_domains = sandbox_allowed_domains or ()
         _raise_if_cancelled(is_cancelled)
@@ -663,7 +718,11 @@ class GeneralSkillRunner:
         run_dir = Path(
             mkdtemp(
                 prefix="general_skill_",
-                dir=str(workspace_root) if workspace_root is not None else None,
+                dir=(
+                    str(run_dir_parent)
+                    if run_dir_parent is not None
+                    else (str(workspace_root) if workspace_root is not None else None)
+                ),
             )
         )
         skill_dir = run_dir / "skill"
